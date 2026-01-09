@@ -82,12 +82,34 @@ SLACK_SIGNING_SECRET=your-signing-secret
 ### 5. Run the Bot
 
 ```bash
-# Development mode (with auto-reload)
+cd /Users/jpathak/workspace/claude-code-slack/claude-code-slack-bot
+
+# Development mode (with auto-reload) - RECOMMENDED
 npm run dev
 
 # Production mode
 npm run build
 npm run prod
+```
+
+#### Running as a Background Service (macOS)
+
+To run the bot as a launchd service that starts automatically:
+
+```bash
+# Load and start the service
+launchctl load ~/Library/LaunchAgents/com.jpathak.claude-code-slack.plist
+launchctl start com.jpathak.claude-code-slack
+
+# Stop the service
+launchctl stop com.jpathak.claude-code-slack
+
+# Unload (disable auto-start)
+launchctl unload ~/Library/LaunchAgents/com.jpathak.claude-code-slack.plist
+
+# View logs
+tail -f ~/Library/Logs/claude-code-slack.log
+tail -f ~/Library/Logs/claude-code-slack.error.log
 ```
 
 ## Usage
@@ -223,6 +245,45 @@ The bot supports MCP servers to extend Claude's capabilities with additional too
 
 All MCP tools are automatically allowed and follow the pattern: `mcp__serverName__toolName`
 
+### Session Continuation
+
+The bot can resume sessions from both CLI and previous Slack conversations, enabling seamless handoff between interfaces.
+
+#### List Available Sessions
+```
+sessions
+```
+Shows all sessions for the current working directory with:
+- Session ID and timestamp
+- Message count
+- Source badge (📱 Slack / 💻 CLI)
+- First message as summary
+- Clickable buttons to resume
+
+#### Resume a Session
+```
+continue              # Resume the most recent session
+continue abc123       # Resume a specific session by ID (partial ID works)
+--continue            # Same as 'continue' (CLI-style syntax)
+-c                    # Short form
+```
+
+#### Session Handoff
+
+**Slack → CLI**: When you resume a Slack session in CLI using `claude --continue`, the bot detects the external modification and posts a notification:
+```
+📤 Session handoff detected
+This session was continued in CLI.
+Further messages here will start a new session.
+```
+
+**CLI → Slack**: Use `continue` in Slack to resume any CLI session and continue working from Slack.
+
+#### How It Works
+- Sessions are stored in `~/.claude/projects/` (shared between CLI and Slack)
+- The bot polls every 30 seconds to detect when CLI takes over
+- Ownership is tracked to enable proper handoff notifications
+
 ## Advanced Configuration
 
 ### Using AWS Bedrock
@@ -257,12 +318,18 @@ This will show detailed logs including:
 ### Project Structure
 ```
 src/
-├── index.ts          # Application entry point
-├── config.ts         # Configuration management
+├── index.ts                      # Application entry point
+├── config.ts                     # Configuration management
 ├── types.ts                      # TypeScript type definitions
 ├── claude-handler.ts             # Claude Code SDK integration
 ├── slack-handler.ts              # Slack event handling
 ├── working-directory-manager.ts  # Working directory management
+├── session-discovery.ts          # Session discovery from ~/.claude/projects/
+├── session-watcher.ts            # Polls for CLI session takeover
+├── file-handler.ts               # File upload processing
+├── todo-manager.ts               # Task list management
+├── mcp-manager.ts                # MCP server configuration
+├── permission-mcp-server.ts      # MCP permission prompts via Slack
 └── logger.ts                     # Logging utility
 ```
 
@@ -271,6 +338,8 @@ src/
 - `npm run build` - Build TypeScript to JavaScript
 - `npm start` - Run the compiled JavaScript
 - `npm run prod` - Run production build
+- `npm test` - Run tests
+- `npm run test:watch` - Run tests in watch mode
 
 ## Troubleshooting
 

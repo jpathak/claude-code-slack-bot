@@ -1,13 +1,17 @@
-import { App } from '@slack/bolt';
-import { ClaudeHandler } from './claude-handler';
+import bolt from '@slack/bolt';
+const { App } = bolt;
+type AppType = InstanceType<typeof App>;
+import { ClaudeHandler } from './claude-handler.js';
 import { SDKMessage } from '@anthropic-ai/claude-code';
-import { Logger } from './logger';
-import { WorkingDirectoryManager } from './working-directory-manager';
-import { FileHandler, ProcessedFile } from './file-handler';
-import { TodoManager, Todo } from './todo-manager';
-import { McpManager } from './mcp-manager';
-import { permissionServer } from './permission-mcp-server';
-import { config } from './config';
+import { Logger } from './logger.js';
+import { WorkingDirectoryManager } from './working-directory-manager.js';
+import { FileHandler, ProcessedFile } from './file-handler.js';
+import { TodoManager, Todo } from './todo-manager.js';
+import { McpManager } from './mcp-manager.js';
+import { permissionServer } from './permission-mcp-server.js';
+import { config } from './config.js';
+import { SessionDiscovery, SessionInfo } from './session-discovery.js';
+import { SessionWatcher } from './session-watcher.js';
 
 interface MessageEvent {
   user: string;
@@ -27,7 +31,7 @@ interface MessageEvent {
 }
 
 export class SlackHandler {
-  private app: App;
+  private app: AppType;
   private claudeHandler: ClaudeHandler;
   private activeControllers: Map<string, AbortController> = new Map();
   private logger = new Logger('SlackHandler');
@@ -35,18 +39,53 @@ export class SlackHandler {
   private fileHandler: FileHandler;
   private todoManager: TodoManager;
   private mcpManager: McpManager;
+  private sessionDiscovery: SessionDiscovery;
+  private sessionWatcher: SessionWatcher;
   private todoMessages: Map<string, string> = new Map(); // sessionKey -> messageTs
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botUserId: string | null = null;
 
-  constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
+  constructor(app: AppType, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
     this.claudeHandler = claudeHandler;
     this.mcpManager = mcpManager;
     this.workingDirManager = new WorkingDirectoryManager();
     this.fileHandler = new FileHandler();
     this.todoManager = new TodoManager();
+    this.sessionDiscovery = new SessionDiscovery();
+    this.sessionWatcher = new SessionWatcher(this.sessionDiscovery, 30000); // Poll every 30s
+
+    // Set up handoff notification callback
+    this.sessionWatcher.onHandoff(async (sessionId, slackContext) => {
+      await this.notifySessionHandoff(sessionId, slackContext);
+    });
+
+    // Start the session watcher
+    this.sessionWatcher.start();
+  }
+
+  /**
+   * Notify Slack that a session was continued in CLI
+   */
+  private async notifySessionHandoff(
+    sessionId: string,
+    slackContext: { channelId: string; threadTs?: string; userId: string }
+  ): Promise<void> {
+    try {
+      const shortId = sessionId.substring(0, 8);
+      const message = `📤 *Session handoff detected*\n\nThis session (\`${shortId}...\`) was continued in the CLI.\nFurther messages here will start a new session.\n\n_Use \`continue\` to resume it again from Slack._`;
+
+      await this.app.client.chat.postMessage({
+        channel: slackContext.channelId,
+        thread_ts: slackContext.threadTs,
+        text: message,
+      });
+
+      this.logger.info('Sent session handoff notification', { sessionId, slackContext });
+    } catch (error) {
+      this.logger.error('Failed to send handoff notification', { sessionId, error });
+    }
   }
 
   async handleMessage(event: MessageEvent, say: any) {
@@ -147,6 +186,18 @@ export class SlackHandler {
       return;
     }
 
+    // Check if this is a continue command
+    if (text && this.isContinueCommand(text)) {
+      await this.handleContinueCommand(user, channel, thread_ts, ts, text, say);
+      return;
+    }
+
+    // Check if this is a sessions list command
+    if (text && this.isSessionsCommand(text)) {
+      await this.handleSessionsCommand(user, channel, thread_ts, ts, say);
+      return;
+    }
+
     // Check if we have a working directory set
     const isDM = channel.startsWith('D');
     const workingDirectory = this.workingDirManager.getWorkingDirectory(
@@ -235,7 +286,7 @@ export class SlackHandler {
       statusMessageTs = statusResult.ts;
 
       // Add thinking reaction to original message (but don't spam if already set)
-      await this.updateMessageReaction(sessionKey, '🤔');
+      await this.updateMessageReaction(sessionKey, 'thinking_face');
       
       // Create Slack context for permission prompts
       const slackContext = {
@@ -268,7 +319,7 @@ export class SlackHandler {
             }
 
             // Update reaction to show working
-            await this.updateMessageReaction(sessionKey, '⚙️');
+            await this.updateMessageReaction(sessionKey, 'gear');
 
             // Check for TodoWrite tool and handle it specially
             const todoTool = message.message.content?.find((part: any) => 
@@ -332,7 +383,12 @@ export class SlackHandler {
       }
 
       // Update reaction to show completion
-      await this.updateMessageReaction(sessionKey, '✅');
+      await this.updateMessageReaction(sessionKey, 'white_check_mark');
+
+      // Update session watcher mod time so it doesn't think CLI took over
+      if (session?.sessionId && workingDirectory) {
+        this.sessionWatcher.updateModTime(session.sessionId);
+      }
 
       this.logger.info('Completed processing message', {
         sessionKey,
@@ -357,7 +413,7 @@ export class SlackHandler {
         }
 
         // Update reaction to show error
-        await this.updateMessageReaction(sessionKey, '❌');
+        await this.updateMessageReaction(sessionKey, 'x');
         
         await say({
           text: `Error: ${error.message || 'Something went wrong'}`,
@@ -376,7 +432,7 @@ export class SlackHandler {
         }
 
         // Update reaction to show cancellation
-        await this.updateMessageReaction(sessionKey, '⏹️');
+        await this.updateMessageReaction(sessionKey, 'stop_button');
       }
 
       // Clean up temporary files in case of error too
@@ -633,11 +689,11 @@ export class SlackHandler {
 
     let emoji: string;
     if (completed === total) {
-      emoji = '✅'; // All tasks completed
+      emoji = 'white_check_mark'; // All tasks completed
     } else if (inProgress > 0) {
-      emoji = '🔄'; // Tasks in progress
+      emoji = 'arrows_counterclockwise'; // Tasks in progress
     } else {
-      emoji = '📋'; // Tasks pending
+      emoji = 'clipboard'; // Tasks pending
     }
 
     await this.updateMessageReaction(sessionKey, emoji);
@@ -649,6 +705,268 @@ export class SlackHandler {
 
   private isMcpReloadCommand(text: string): boolean {
     return /^(mcp|servers?)\s+(reload|refresh)$/i.test(text.trim());
+  }
+
+  private isContinueCommand(text: string): boolean {
+    // Match: continue, --continue, -c, continue <session-id>
+    return /^(--?continue|continue|-c)(\s+\S+)?$/i.test(text.trim());
+  }
+
+  private isSessionsCommand(text: string): boolean {
+    // Match: sessions, list sessions, session list
+    return /^(sessions?|list\s+sessions?|sessions?\s+list)(\?)?$/i.test(text.trim());
+  }
+
+  private extractSessionIdFromContinue(text: string): string | null {
+    const match = text.trim().match(/^(?:--?continue|continue|-c)\s+(\S+)$/i);
+    return match ? match[1] : null;
+  }
+
+  private async handleContinueCommand(
+    user: string,
+    channel: string,
+    thread_ts: string | undefined,
+    ts: string,
+    text: string,
+    say: any
+  ): Promise<void> {
+    const isDM = channel.startsWith('D');
+    const workingDirectory = this.workingDirManager.getExplicitWorkingDirectory(
+      channel,
+      thread_ts,
+      isDM ? user : undefined
+    );
+
+    if (!workingDirectory) {
+      await say({
+        text: `⚠️ No working directory set for this conversation. Please set one first using \`cwd /path/to/directory\` before using \`continue\`.\n\n_Note: The \`continue\` command requires an explicitly set directory, not the base directory fallback._`,
+        thread_ts: thread_ts || ts,
+      });
+      return;
+    }
+
+    // Check if Claude projects directory exists
+    if (!this.sessionDiscovery.isClaudeConfigured()) {
+      await say({
+        text: `⚠️ Claude Code is not configured on this machine.\nNo sessions found in \`~/.claude/projects/\`.`,
+        thread_ts: thread_ts || ts,
+      });
+      return;
+    }
+
+    // Check if a specific session ID was provided
+    const specificSessionId = this.extractSessionIdFromContinue(text);
+
+    try {
+      let sessionToResume: SessionInfo | null = null;
+
+      if (specificSessionId) {
+        // Try to find the specific session
+        sessionToResume = await this.sessionDiscovery.getSessionById(specificSessionId, workingDirectory);
+        if (!sessionToResume) {
+          await say({
+            text: `❌ Session \`${specificSessionId}\` not found for working directory \`${workingDirectory}\`.\n\nUse \`sessions\` to see available sessions.`,
+            thread_ts: thread_ts || ts,
+          });
+          return;
+        }
+      } else {
+        // Get the latest session
+        sessionToResume = await this.sessionDiscovery.getLatestSession(workingDirectory);
+        if (!sessionToResume) {
+          await say({
+            text: `ℹ️ No previous sessions found for \`${workingDirectory}\`.\n\nStart a new conversation by sending a message.`,
+            thread_ts: thread_ts || ts,
+          });
+          return;
+        }
+      }
+
+      // Create or update the session in ClaudeHandler
+      const sessionKey = this.claudeHandler.getSessionKey(user, channel, thread_ts || ts);
+      let session = this.claudeHandler.getSession(user, channel, thread_ts || ts);
+
+      if (!session) {
+        session = this.claudeHandler.createSession(user, channel, thread_ts || ts);
+      }
+
+      // Set the session ID to the one we're resuming
+      session.sessionId = sessionToResume.sessionId;
+      session.isResumed = true;
+      session.resumedFrom = sessionToResume.owner || 'cli';
+      session.workingDirectory = workingDirectory;
+
+      // Set ownership to Slack
+      this.sessionDiscovery.setSessionOwnership(sessionToResume.sessionId, workingDirectory, {
+        channelId: channel,
+        threadTs: thread_ts,
+        userId: user,
+      });
+
+      // Start watching the session for external modifications
+      this.sessionWatcher.watchSession(sessionToResume.sessionId, workingDirectory, {
+        channelId: channel,
+        threadTs: thread_ts,
+        userId: user,
+      });
+
+      const shortId = sessionToResume.sessionId.substring(0, 8);
+      const timeAgo = this.formatTimeAgo(sessionToResume.lastActivity);
+      const sourceBadge = sessionToResume.owner === 'slack' ? '📱 Slack' : '💻 CLI';
+
+      let resumeMessage = `📥 *Resuming session* \`${shortId}...\`\n\n`;
+      resumeMessage += `• *Last active:* ${timeAgo}\n`;
+      resumeMessage += `• *Messages:* ${sessionToResume.messageCount}\n`;
+      resumeMessage += `• *Source:* ${sourceBadge}\n`;
+      resumeMessage += `• *Working directory:* \`${workingDirectory}\`\n\n`;
+      resumeMessage += `_"${sessionToResume.summary}"_\n\n`;
+      resumeMessage += `You can now continue the conversation. Send a message to interact with this session.`;
+
+      await say({
+        text: resumeMessage,
+        thread_ts: thread_ts || ts,
+      });
+
+      this.logger.info('Resumed session', {
+        sessionId: sessionToResume.sessionId,
+        workingDirectory,
+        messageCount: sessionToResume.messageCount,
+        user,
+        channel,
+      });
+    } catch (error) {
+      this.logger.error('Error handling continue command', { error });
+      await say({
+        text: `❌ Error resuming session: ${(error as Error).message}`,
+        thread_ts: thread_ts || ts,
+      });
+    }
+  }
+
+  private async handleSessionsCommand(
+    user: string,
+    channel: string,
+    thread_ts: string | undefined,
+    ts: string,
+    say: any
+  ): Promise<void> {
+    const isDM = channel.startsWith('D');
+    const workingDirectory = this.workingDirManager.getExplicitWorkingDirectory(
+      channel,
+      thread_ts,
+      isDM ? user : undefined
+    );
+
+    if (!workingDirectory) {
+      await say({
+        text: `⚠️ No working directory set for this conversation. Please set one first using \`cwd /path/to/directory\`.\n\n_Note: The \`sessions\` command requires an explicitly set directory, not the base directory fallback._`,
+        thread_ts: thread_ts || ts,
+      });
+      return;
+    }
+
+    if (!this.sessionDiscovery.isClaudeConfigured()) {
+      await say({
+        text: `⚠️ Claude Code is not configured on this machine.\nNo sessions found in \`~/.claude/projects/\`.`,
+        thread_ts: thread_ts || ts,
+      });
+      return;
+    }
+
+    try {
+      const sessions = await this.sessionDiscovery.listSessions(workingDirectory);
+
+      if (sessions.length === 0) {
+        await say({
+          text: `ℹ️ No sessions found for \`${workingDirectory}\`.\n\nStart a new conversation by sending a message.`,
+          thread_ts: thread_ts || ts,
+        });
+        return;
+      }
+
+      // Format sessions list with interactive buttons
+      const maxSessions = 10; // Limit to avoid message overflow
+      const displaySessions = sessions.slice(0, maxSessions);
+
+      let message = `📋 *Available Sessions* for \`${workingDirectory}\`\n\n`;
+
+      for (let i = 0; i < displaySessions.length; i++) {
+        const session = displaySessions[i];
+        message += `${i + 1}. ${this.sessionDiscovery.formatSessionForSlack(session)}\n\n`;
+      }
+
+      if (sessions.length > maxSessions) {
+        message += `\n_...and ${sessions.length - maxSessions} more sessions_\n`;
+      }
+
+      message += `\n*To resume a session:*\n`;
+      message += `• \`continue\` - Resume the most recent session\n`;
+      message += `• \`continue <id>\` - Resume a specific session by ID\n`;
+
+      // Create interactive buttons for the top 5 sessions
+      const blocks: any[] = [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: message,
+          },
+        },
+      ];
+
+      // Add buttons for quick session selection (top 5)
+      const buttonSessions = displaySessions.slice(0, 5);
+      if (buttonSessions.length > 0) {
+        const buttons = buttonSessions.map((session, index) => ({
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: `${index + 1}. ${session.sessionId.substring(0, 8)}`,
+            emoji: true,
+          },
+          value: `${session.sessionId}|${workingDirectory}`,
+          action_id: `resume_session_${index}`,
+        }));
+
+        blocks.push({
+          type: 'actions',
+          elements: buttons,
+        });
+      }
+
+      await say({
+        text: message, // Fallback for notifications
+        blocks,
+        thread_ts: thread_ts || ts,
+      });
+
+      this.logger.info('Listed sessions', {
+        workingDirectory,
+        count: sessions.length,
+        displayedCount: displaySessions.length,
+      });
+    } catch (error) {
+      this.logger.error('Error handling sessions command', { error });
+      await say({
+        text: `❌ Error listing sessions: ${(error as Error).message}`,
+        thread_ts: thread_ts || ts,
+      });
+    }
+  }
+
+  private formatTimeAgo(date: Date): string {
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return 'just now';
+    if (diffMins < 60) return `${diffMins} minutes ago`;
+    if (diffHours < 24) return `${diffHours} hours ago`;
+    if (diffDays < 7) return `${diffDays} days ago`;
+
+    return date.toLocaleDateString();
   }
 
   private async getBotUserId(): Promise<string> {
@@ -714,7 +1032,7 @@ export class SlackHandler {
 
   setupEventHandlers() {
     // Handle direct messages
-    this.app.message(async ({ message, say }) => {
+    this.app.message(async ({ message, say }: any) => {
       if (message.subtype === undefined && 'user' in message) {
         this.logger.info('Handling direct message event');
         await this.handleMessage(message as MessageEvent, say);
@@ -722,7 +1040,7 @@ export class SlackHandler {
     });
 
     // Handle app mentions
-    this.app.event('app_mention', async ({ event, say }) => {
+    this.app.event('app_mention', async ({ event, say }: any) => {
       this.logger.info('Handling app mention event');
       const text = event.text.replace(/<@[^>]+>/g, '').trim();
       await this.handleMessage({
@@ -732,7 +1050,7 @@ export class SlackHandler {
     });
 
     // Handle file uploads in threads
-    this.app.event('message', async ({ event, say }) => {
+    this.app.event('message', async ({ event, say }: any) => {
       // Only handle file uploads that are not from bots and have files
       if (event.subtype === 'file_share' && 'user' in event && event.files) {
         this.logger.info('Handling file upload event');
@@ -741,7 +1059,7 @@ export class SlackHandler {
     });
 
     // Handle bot being added to channels
-    this.app.event('member_joined_channel', async ({ event, say }) => {
+    this.app.event('member_joined_channel', async ({ event, say }: any) => {
       // Check if the bot was added to the channel
       if (event.user === await this.getBotUserId()) {
         this.logger.info('Bot added to channel', { channel: event.channel });
@@ -750,13 +1068,13 @@ export class SlackHandler {
     });
 
     // Handle permission approval button clicks
-    this.app.action('approve_tool', async ({ ack, body, respond }) => {
+    this.app.action('approve_tool', async ({ ack, body, respond }: any) => {
       await ack();
       const approvalId = (body as any).actions[0].value;
       this.logger.info('Tool approval granted', { approvalId });
-      
+
       permissionServer.resolveApproval(approvalId, true);
-      
+
       await respond({
         response_type: 'ephemeral',
         text: '✅ Tool execution approved'
@@ -764,18 +1082,97 @@ export class SlackHandler {
     });
 
     // Handle permission denial button clicks
-    this.app.action('deny_tool', async ({ ack, body, respond }) => {
+    this.app.action('deny_tool', async ({ ack, body, respond }: any) => {
       await ack();
       const approvalId = (body as any).actions[0].value;
       this.logger.info('Tool approval denied', { approvalId });
-      
+
       permissionServer.resolveApproval(approvalId, false);
-      
+
       await respond({
         response_type: 'ephemeral',
         text: '❌ Tool execution denied'
       });
     });
+
+    // Handle session resume button clicks (resume_session_0 through resume_session_4)
+    for (let i = 0; i < 5; i++) {
+      this.app.action(`resume_session_${i}`, async ({ ack, body, respond, say }: any) => {
+        await ack();
+
+        const value = (body as any).actions[0].value;
+        const [sessionId, workingDirectory] = value.split('|');
+        const user = body.user.id;
+        const channel = body.channel.id;
+        const threadTs = body.message?.thread_ts;
+
+        this.logger.info('Session resume button clicked', {
+          sessionId,
+          workingDirectory,
+          user,
+          channel,
+        });
+
+        try {
+          // Get the session info
+          const sessionInfo = await this.sessionDiscovery.getSessionById(sessionId, workingDirectory);
+
+          if (!sessionInfo) {
+            await respond({
+              response_type: 'ephemeral',
+              text: `❌ Session \`${sessionId.substring(0, 8)}\` not found.`,
+            });
+            return;
+          }
+
+          // Create or update the session in ClaudeHandler
+          let session = this.claudeHandler.getSession(user, channel, threadTs);
+          if (!session) {
+            session = this.claudeHandler.createSession(user, channel, threadTs);
+          }
+
+          // Set the session ID to the one we're resuming
+          session.sessionId = sessionInfo.sessionId;
+          session.isResumed = true;
+          session.resumedFrom = sessionInfo.owner || 'cli';
+          session.workingDirectory = workingDirectory;
+
+          // Set ownership to Slack
+          this.sessionDiscovery.setSessionOwnership(sessionInfo.sessionId, workingDirectory, {
+            channelId: channel,
+            threadTs,
+            userId: user,
+          });
+
+          // Start watching the session
+          this.sessionWatcher.watchSession(sessionInfo.sessionId, workingDirectory, {
+            channelId: channel,
+            threadTs,
+            userId: user,
+          });
+
+          const shortId = sessionInfo.sessionId.substring(0, 8);
+          const timeAgo = this.formatTimeAgo(sessionInfo.lastActivity);
+
+          await respond({
+            response_type: 'in_channel',
+            text: `📥 *Session resumed:* \`${shortId}...\` (${timeAgo}, ${sessionInfo.messageCount} messages)\n\nYou can now continue the conversation.`,
+          });
+
+          this.logger.info('Session resumed via button', {
+            sessionId: sessionInfo.sessionId,
+            user,
+            channel,
+          });
+        } catch (error) {
+          this.logger.error('Error resuming session via button', { error });
+          await respond({
+            response_type: 'ephemeral',
+            text: `❌ Error resuming session: ${(error as Error).message}`,
+          });
+        }
+      });
+    }
 
     // Cleanup inactive sessions periodically
     setInterval(() => {

@@ -1,6 +1,6 @@
-import { WorkingDirectoryConfig } from './types';
-import { Logger } from './logger';
-import { config } from './config';
+import { WorkingDirectoryConfig } from './types.js';
+import { Logger } from './logger.js';
+import { config } from './config.js';
 import * as path from 'path';
 import * as fs from 'fs';
 
@@ -97,7 +97,7 @@ export class WorkingDirectoryManager {
   }
 
   getWorkingDirectory(channelId: string, threadTs?: string, userId?: string): string | undefined {
-    // Priority: Thread > Channel/DM
+    // Priority: Thread > Channel/DM > Base Directory (if set)
     if (threadTs) {
       const threadKey = this.getConfigKey(channelId, threadTs);
       const threadConfig = this.configs.get(threadKey);
@@ -121,7 +121,49 @@ export class WorkingDirectoryManager {
       return channelConfig.directory;
     }
 
+    // Fall back to base directory if configured
+    if (config.baseDirectory && fs.existsSync(config.baseDirectory)) {
+      this.logger.debug('Using base directory as fallback', {
+        directory: config.baseDirectory,
+        channelId,
+      });
+      return config.baseDirectory;
+    }
+
     this.logger.debug('No working directory configured', { channelId, threadTs });
+    return undefined;
+  }
+
+  /**
+   * Get working directory only if explicitly set (no base directory fallback)
+   * Use this for session commands where we need the exact project directory
+   */
+  getExplicitWorkingDirectory(channelId: string, threadTs?: string, userId?: string): string | undefined {
+    // Priority: Thread > Channel/DM (NO base directory fallback)
+    if (threadTs) {
+      const threadKey = this.getConfigKey(channelId, threadTs);
+      const threadConfig = this.configs.get(threadKey);
+      if (threadConfig) {
+        this.logger.debug('Using thread-specific working directory (explicit)', {
+          directory: threadConfig.directory,
+          threadTs,
+        });
+        return threadConfig.directory;
+      }
+    }
+
+    // Fall back to channel or DM config only
+    const channelKey = this.getConfigKey(channelId, undefined, userId);
+    const channelConfig = this.configs.get(channelKey);
+    if (channelConfig) {
+      this.logger.debug('Using channel/DM working directory (explicit)', {
+        directory: channelConfig.directory,
+        channelId,
+      });
+      return channelConfig.directory;
+    }
+
+    this.logger.debug('No explicit working directory configured', { channelId, threadTs });
     return undefined;
   }
 

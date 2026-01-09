@@ -9,7 +9,7 @@ export const config = {
     signingSecret: process.env.SLACK_SIGNING_SECRET!,
   },
   anthropic: {
-    apiKey: process.env.ANTHROPIC_API_KEY!,
+    apiKey: process.env.ANTHROPIC_API_KEY || undefined,
   },
   claude: {
     useBedrock: process.env.CLAUDE_CODE_USE_BEDROCK === '1',

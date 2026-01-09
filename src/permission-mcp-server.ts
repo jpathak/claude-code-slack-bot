@@ -90,7 +90,11 @@ class PermissionMCPServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name === "permission_prompt") {
-        return await this.handlePermissionPrompt(request.params.arguments as PermissionRequest);
+        const args = request.params.arguments as Record<string, unknown> | undefined;
+        if (!args || typeof args.tool_name !== 'string' || !args.input) {
+          throw new Error('Invalid permission_prompt arguments: missing tool_name or input');
+        }
+        return await this.handlePermissionPrompt(args as unknown as PermissionRequest);
       }
       throw new Error(`Unknown tool: ${request.params.name}`);
     });

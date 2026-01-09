@@ -1,9 +1,10 @@
-import { App } from '@slack/bolt';
-import { config, validateConfig } from './config';
-import { ClaudeHandler } from './claude-handler';
-import { SlackHandler } from './slack-handler';
-import { McpManager } from './mcp-manager';
-import { Logger } from './logger';
+import pkg from '@slack/bolt';
+const { App } = pkg;
+import { config, validateConfig } from './config.js';
+import { ClaudeHandler } from './claude-handler.js';
+import { SlackHandler } from './slack-handler.js';
+import { McpManager } from './mcp-manager.js';
+import { Logger } from './logger.js';
 
 const logger = new Logger('Main');
 
