@@ -35,4 +35,4 @@ yarn-error.log*
 
 # Testing
 coverage/
-.nyc_output/
+.nyc_output/.claude-memory-runtime/

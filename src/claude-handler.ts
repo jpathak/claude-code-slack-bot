@@ -44,56 +44,36 @@ export class ClaudeHandler {
       permissionMode: 'bypassPermissions',
     };
 
-    // Add permission prompt tool if we have Slack context
-    if (slackContext) {
-      options.permissionPromptToolName = 'mcp__permission-prompt__permission_prompt';
-      this.logger.debug('Added permission prompt tool for Slack integration', slackContext);
-    }
+    // NOTE: Permission prompt MCP server disabled due to compatibility issues
+    // TODO: Re-enable when MCP server issues are resolved
+    // if (slackContext) {
+    //   options.permissionPromptToolName = 'mcp__permission-prompt__permission_prompt';
+    //   this.logger.debug('Added permission prompt tool for Slack integration', slackContext);
+    // }
 
     if (workingDirectory) {
       options.cwd = workingDirectory;
     }
 
-    // Add MCP server configuration if available
+    // Add MCP server configuration if available (excluding permission-prompt which has issues)
     const mcpServers = this.mcpManager.getServerConfiguration();
-    
-    // Add permission prompt server if we have Slack context
-    if (slackContext) {
-      const permissionServer = {
-        'permission-prompt': {
-          command: 'npx',
-          args: ['tsx', new URL('../src/permission-mcp-server.ts', import.meta.url).pathname],
-          env: {
-            SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
-            SLACK_CONTEXT: JSON.stringify(slackContext)
-          }
-        }
-      };
-      
-      if (mcpServers) {
-        options.mcpServers = { ...mcpServers, ...permissionServer };
-      } else {
-        options.mcpServers = permissionServer;
-      }
-    } else if (mcpServers && Object.keys(mcpServers).length > 0) {
+
+    // NOTE: Permission prompt MCP server disabled due to compatibility issues
+    // The permission-prompt server was causing "Claude Code process exited with code 1" errors
+
+    if (mcpServers && Object.keys(mcpServers).length > 0) {
       options.mcpServers = mcpServers;
-    }
-    
-    if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
-      // Allow all MCP tools by default, plus permission prompt tool
+
+      // Allow all MCP tools by default
       const defaultMcpTools = this.mcpManager.getDefaultAllowedTools();
-      if (slackContext) {
-        defaultMcpTools.push('mcp__permission-prompt');
-      }
       if (defaultMcpTools.length > 0) {
         options.allowedTools = defaultMcpTools;
       }
-      
+
       this.logger.debug('Added MCP configuration to options', {
         serverCount: Object.keys(options.mcpServers).length,
         servers: Object.keys(options.mcpServers),
         allowedTools: defaultMcpTools,
-        hasSlackContext: !!slackContext,
       });
     }
 

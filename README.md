@@ -81,8 +81,13 @@ SLACK_SIGNING_SECRET=your-signing-secret
 
 ### 5. Run the Bot
 
+**Important:** Use Node.js 22 LTS (Node 25 has compatibility issues with the Claude Code SDK).
+
 ```bash
 cd /Users/jpathak/workspace/claude-code-slack/claude-code-slack-bot
+
+# Use Node 22 (required for SDK compatibility)
+export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
 
 # Development mode (with auto-reload) - RECOMMENDED
 npm run dev
