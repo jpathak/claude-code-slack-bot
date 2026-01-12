@@ -2,7 +2,9 @@ import bolt from '@slack/bolt';
 const { App } = bolt;
 type AppType = InstanceType<typeof App>;
 import { ClaudeHandler } from './claude-handler.js';
-import { SDKMessage } from '@anthropic-ai/claude-code';
+// Use ClaudeMessage from our wrapper instead of SDK (SDK has compatibility issues)
+import { ClaudeMessage } from './claude-cli-wrapper.js';
+type SDKMessage = ClaudeMessage;
 import { Logger } from './logger.js';
 import { WorkingDirectoryManager } from './working-directory-manager.js';
 import { FileHandler, ProcessedFile } from './file-handler.js';
@@ -304,10 +306,11 @@ export class SlackHandler {
           message: message,
         });
 
-        if (message.type === 'assistant') {
+        if (message.type === 'assistant' && message.message) {
           // Check if this is a tool use message
-          const hasToolUse = message.message.content?.some((part: any) => part.type === 'tool_use');
-          
+          const content = message.message.content || [];
+          const hasToolUse = content.some((part: any) => part.type === 'tool_use');
+
           if (hasToolUse) {
             // Update status to show working
             if (statusMessageTs) {
@@ -322,7 +325,7 @@ export class SlackHandler {
             await this.updateMessageReaction(sessionKey, 'gear');
 
             // Check for TodoWrite tool and handle it specially
-            const todoTool = message.message.content?.find((part: any) => 
+            const todoTool = content.find((part: any) =>
               part.type === 'tool_use' && part.name === 'TodoWrite'
             );
 
@@ -331,7 +334,7 @@ export class SlackHandler {
             }
 
             // For other tool use messages, format them immediately as new messages
-            const toolContent = this.formatToolUse(message.message.content);
+            const toolContent = this.formatToolUse(content);
             if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
               await say({
                 text: toolContent,
@@ -456,7 +459,7 @@ export class SlackHandler {
   }
 
   private extractTextContent(message: SDKMessage): string | null {
-    if (message.type === 'assistant' && message.message.content) {
+    if (message.type === 'assistant' && message.message?.content) {
       const textParts = message.message.content
         .filter((part: any) => part.type === 'text')
         .map((part: any) => part.text);
@@ -1028,6 +1031,122 @@ export class SlackHandler {
       .replace(/__([^_]+)__/g, '_$1_');
 
     return formatted;
+  }
+
+  /**
+   * Process a self-debug message after crash detection
+   * This is called from index.ts when a crash is detected on startup
+   */
+  async processSelfDebugMessage(
+    channel: string,
+    threadTs: string,
+    debugPrompt: string
+  ): Promise<void> {
+    this.logger.info('Processing self-debug message', { channel, threadTs });
+
+    // Use a synthetic user ID for self-debugging
+    const selfDebugUser = 'self-debug';
+    const isDM = channel.startsWith('D');
+
+    // Get working directory (use the project directory for self-debugging)
+    const workingDirectory = process.cwd();
+
+    const sessionKey = this.claudeHandler.getSessionKey(selfDebugUser, channel, threadTs);
+    const abortController = new AbortController();
+    this.activeControllers.set(sessionKey, abortController);
+
+    // Create a new session for self-debugging
+    const session = this.claudeHandler.createSession(selfDebugUser, channel, threadTs);
+
+    try {
+      let statusMessageTs: string | undefined;
+
+      // Send initial status
+      const statusResult = await this.app.client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: '🔍 *Analyzing crash logs...*',
+      });
+      statusMessageTs = statusResult.ts as string;
+
+      // Process through Claude
+      for await (const message of this.claudeHandler.streamQuery(
+        debugPrompt,
+        session,
+        abortController,
+        workingDirectory
+      )) {
+        if (abortController.signal.aborted) break;
+
+        if (message.type === 'assistant' && message.message) {
+          const content = message.message.content || [];
+          const hasToolUse = content.some((part: any) => part.type === 'tool_use');
+
+          if (hasToolUse) {
+            // Update status
+            if (statusMessageTs) {
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: '🔧 *Investigating fix...*',
+              });
+            }
+
+            // Format tool usage
+            const toolContent = this.formatToolUse(content);
+            if (toolContent) {
+              await this.app.client.chat.postMessage({
+                channel,
+                thread_ts: threadTs,
+                text: toolContent,
+              });
+            }
+          } else {
+            // Handle text response
+            const textContent = this.extractTextContent(message);
+            if (textContent) {
+              const formatted = this.formatMessage(textContent, false);
+              await this.app.client.chat.postMessage({
+                channel,
+                thread_ts: threadTs,
+                text: formatted,
+              });
+            }
+          }
+        } else if (message.type === 'result') {
+          if (message.subtype === 'success' && (message as any).result) {
+            const finalResult = (message as any).result;
+            const formatted = this.formatMessage(finalResult, true);
+            await this.app.client.chat.postMessage({
+              channel,
+              thread_ts: threadTs,
+              text: formatted,
+            });
+          }
+        }
+      }
+
+      // Update status to completed
+      if (statusMessageTs) {
+        await this.app.client.chat.update({
+          channel,
+          ts: statusMessageTs,
+          text: '✅ *Crash analysis completed*',
+        });
+      }
+
+      this.logger.info('Self-debugging completed successfully');
+    } catch (error) {
+      this.logger.error('Error during self-debugging', error);
+
+      await this.app.client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `❌ Error during self-debugging: ${(error as Error).message}`,
+      });
+    } finally {
+      this.activeControllers.delete(sessionKey);
+    }
   }
 
   setupEventHandlers() {

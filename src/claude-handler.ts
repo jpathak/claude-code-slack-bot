@@ -1,15 +1,22 @@
-import { query, type SDKMessage } from '@anthropic-ai/claude-code';
+// Temporarily disabled SDK due to hanging issue, using CLI wrapper instead
+// import { query, type SDKMessage } from '@anthropic-ai/claude-code';
 import { ConversationSession } from './types.js';
 import { Logger } from './logger.js';
 import { McpManager, McpServerConfig } from './mcp-manager.js';
+import { ClaudeCLIWrapper, type ClaudeMessage } from './claude-cli-wrapper.js';
+
+// Use ClaudeMessage instead of SDKMessage
+type SDKMessage = ClaudeMessage;
 
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession> = new Map();
   private logger = new Logger('ClaudeHandler');
   private mcpManager: McpManager;
+  private cliWrapper: ClaudeCLIWrapper;
 
   constructor(mcpManager: McpManager) {
     this.mcpManager = mcpManager;
+    this.cliWrapper = new ClaudeCLIWrapper();
   }
 
   getSessionKey(userId: string, channelId: string, threadTs?: string): string {
@@ -41,6 +48,8 @@ export class ClaudeHandler {
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const options: any = {
       outputFormat: 'stream-json',
+      // Note: The SDK property permissionMode translates to the CLI flag --permission-mode
+      // The value must be exactly 'bypassPermissions' (camelCase) not 'bypass-permissions'
       permissionMode: 'bypassPermissions',
     };
 
@@ -87,14 +96,12 @@ export class ClaudeHandler {
     this.logger.debug('Claude query options', options);
 
     try {
-      for await (const message of query({
-        prompt,
-        options,
-      })) {
+      // Use CLI wrapper instead of SDK (SDK hangs due to compatibility issues)
+      for await (const message of this.cliWrapper.streamQuery(prompt, options)) {
         if (message.type === 'system' && message.subtype === 'init') {
           if (session) {
             session.sessionId = message.session_id;
-            this.logger.info('Session initialized', { 
+            this.logger.info('Session initialized', {
               sessionId: message.session_id,
               model: (message as any).model,
               tools: (message as any).tools?.length || 0,

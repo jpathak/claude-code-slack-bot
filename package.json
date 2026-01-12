@@ -27,6 +27,8 @@
     "@slack/bolt": "^4.4.0",
     "@types/node-fetch": "^2.6.12",
     "dotenv": "^16.6.0",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
   }
 }
