@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir, platform } from 'os';
 import { Logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -14,6 +15,21 @@ export interface CrashInfo {
   analyzed: boolean;
 }
 
+/**
+ * Get the default error log path based on platform
+ */
+function getDefaultErrorLogPath(): string {
+  const home = homedir();
+  switch (platform()) {
+    case 'darwin':
+      return join(home, 'Library', 'Logs', 'claude-code-slack.error.log');
+    case 'win32':
+      return join(home, 'AppData', 'Local', 'claude-code-slack', 'error.log');
+    default: // linux and others
+      return join(home, '.local', 'share', 'claude-code-slack', 'error.log');
+  }
+}
+
 export class CrashDetector {
   private logger = new Logger('CrashDetector');
   private crashStateFile: string;
@@ -25,8 +41,7 @@ export class CrashDetector {
     const dataDir = join(__dirname, '..', '.crash-data');
     this.crashStateFile = join(dataDir, 'crash-state.json');
     this.lastStartupFile = join(dataDir, 'last-startup.txt');
-    this.errorLogPath = process.env.ERROR_LOG_PATH ||
-      '/Users/jpathak/Library/Logs/claude-code-slack.error.log';
+    this.errorLogPath = process.env.ERROR_LOG_PATH || getDefaultErrorLogPath();
 
     // Ensure data directory exists
     this.ensureDataDir(dataDir);

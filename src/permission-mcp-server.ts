@@ -102,14 +102,21 @@ class PermissionMCPServer {
 
   private async handlePermissionPrompt(params: PermissionRequest) {
     const { tool_name, input } = params;
-    
+
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
-    const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
+    let slackContext: { channel?: string; threadTs?: string; user?: string } = {};
+    if (slackContextStr) {
+      try {
+        slackContext = JSON.parse(slackContextStr);
+      } catch (e) {
+        logger.warn('Failed to parse SLACK_CONTEXT environment variable', { error: e });
+      }
+    }
     const { channel, threadTs: thread_ts, user } = slackContext;
-    
+
     // Generate unique approval ID
-    const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
     
     // Create approval message with buttons
     const blocks = [

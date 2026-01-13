@@ -42,6 +42,7 @@ export interface StreamQueryOptions {
   resume?: string;
   allowedTools?: string[];
   mcpServers?: Record<string, any>;
+  abortSignal?: AbortSignal;
 }
 
 export class ClaudeCLIWrapper {
@@ -85,19 +86,17 @@ export class ClaudeCLIWrapper {
       args.push('--mcp-config', mcpConfig);
     }
 
-    // Add the prompt as the last argument
-    args.push(prompt);
+    // Pass prompt via stdin with -p flag (reads from stdin)
+    args.push('-p', '-');
 
     this.logger.debug('Starting Claude CLI', {
       claudePath: this.claudePath,
-      args: args.slice(0, -1), // Don't log the full prompt
+      args: args,
       cwd: options.cwd || process.cwd()
     });
 
     // Use current Node (should be Node 22 from PATH set in LaunchAgent)
-    // Fallback paths for Node 22 if needed
-    const nodePath = process.env.CLAUDE_NODE_PATH ||
-      process.execPath; // Use the current Node.js executable
+    const nodePath = process.env.CLAUDE_NODE_PATH || process.execPath;
 
     this.logger.info('Using Node executable', { nodePath, claudePath: this.claudePath });
 
@@ -109,13 +108,24 @@ export class ClaudeCLIWrapper {
 
     this.logger.info('Spawned Claude CLI process', { pid: child.pid });
 
-    // Close stdin immediately since we're passing prompt as argument
+    // Handle abort signal - kill child process when aborted
+    const abortHandler = () => {
+      this.logger.info('Abort signal received, killing child process', { pid: child.pid });
+      child.kill('SIGTERM');
+    };
+
+    if (options.abortSignal) {
+      options.abortSignal.addEventListener('abort', abortHandler, { once: true });
+    }
+
+    // Write prompt to stdin and close it
+    child.stdin!.write(prompt);
     child.stdin!.end();
 
     // Handle stderr
     child.stderr!.on('data', (data: Buffer) => {
       const stderr = data.toString();
-      this.logger.info('CLI stderr received', { stderr: stderr.substring(0, 500) });
+      this.logger.debug('CLI stderr received', { stderr: stderr.substring(0, 500) });
     });
 
     // Handle process errors
@@ -125,36 +135,53 @@ export class ClaudeCLIWrapper {
 
     child.on('exit', (code, signal) => {
       this.logger.info('Claude CLI process exited', { code, signal });
+      // Clean up abort listener
+      if (options.abortSignal) {
+        options.abortSignal.removeEventListener('abort', abortHandler);
+      }
     });
 
     let outputBuffer = '';
     let messageCount = 0;
 
     // Convert stream to async iterator
-    for await (const chunk of child.stdout!) {
-      const chunkStr = chunk.toString();
-      this.logger.info('Received stdout chunk', { length: chunkStr.length });
-      outputBuffer += chunkStr;
-      const lines = outputBuffer.split('\n');
-
-      // Process all complete lines
-      for (let i = 0; i < lines.length - 1; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-
-        try {
-          const message: ClaudeMessage = JSON.parse(line);
-          messageCount++;
-          this.logger.info('Yielding message', { messageCount, type: message.type });
-          yield message;
-        } catch (e) {
-          // Skip non-JSON output (could be verbose logs)
-          this.logger.debug('Non-JSON output', { line: line.substring(0, 100) });
+    try {
+      for await (const chunk of child.stdout!) {
+        // Check if aborted
+        if (options.abortSignal?.aborted) {
+          this.logger.info('Processing aborted');
+          break;
         }
-      }
 
-      // Keep the incomplete line in buffer
-      outputBuffer = lines[lines.length - 1];
+        const chunkStr = chunk.toString();
+        this.logger.debug('Received stdout chunk', { length: chunkStr.length });
+        outputBuffer += chunkStr;
+        const lines = outputBuffer.split('\n');
+
+        // Process all complete lines
+        for (let i = 0; i < lines.length - 1; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+
+          try {
+            const message: ClaudeMessage = JSON.parse(line);
+            messageCount++;
+            this.logger.debug('Yielding message', { messageCount, type: message.type });
+            yield message;
+          } catch (e) {
+            // Skip non-JSON output (could be verbose logs)
+            this.logger.debug('Non-JSON output', { line: line.substring(0, 100) });
+          }
+        }
+
+        // Keep the incomplete line in buffer
+        outputBuffer = lines[lines.length - 1];
+      }
+    } finally {
+      // Ensure cleanup on any exit
+      if (options.abortSignal) {
+        options.abortSignal.removeEventListener('abort', abortHandler);
+      }
     }
 
     this.logger.info('Stdout stream ended', { totalMessages: messageCount });
@@ -164,7 +191,7 @@ export class ClaudeCLIWrapper {
       try {
         const message: ClaudeMessage = JSON.parse(outputBuffer.trim());
         messageCount++;
-        this.logger.info('Yielding final message', { messageCount, type: message.type });
+        this.logger.debug('Yielding final message', { messageCount, type: message.type });
         yield message;
       } catch (e) {
         this.logger.debug('Final non-JSON output', { line: outputBuffer.substring(0, 100) });

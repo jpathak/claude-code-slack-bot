@@ -15,6 +15,13 @@ import { config } from './config.js';
 import { SessionDiscovery, SessionInfo } from './session-discovery.js';
 import { SessionWatcher } from './session-watcher.js';
 
+// Configuration constants
+const SESSION_CLEANUP_DELAY_MS = 5 * 60 * 1000; // 5 minutes - delay before cleaning up session data
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes - how often to run session cleanup
+const SESSION_WATCHER_POLL_MS = 30000; // 30 seconds - poll interval for session watcher
+const MAX_DISPLAYED_SESSIONS = 10; // Maximum sessions to display in list
+const MAX_SESSION_BUTTONS = 5; // Maximum quick-select buttons for sessions
+
 interface MessageEvent {
   user: string;
   channel: string;
@@ -47,6 +54,7 @@ export class SlackHandler {
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botUserId: string | null = null;
+  private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(app: AppType, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -56,7 +64,7 @@ export class SlackHandler {
     this.fileHandler = new FileHandler();
     this.todoManager = new TodoManager();
     this.sessionDiscovery = new SessionDiscovery();
-    this.sessionWatcher = new SessionWatcher(this.sessionDiscovery, 30000); // Poll every 30s
+    this.sessionWatcher = new SessionWatcher(this.sessionDiscovery, SESSION_WATCHER_POLL_MS);
 
     // Set up handoff notification callback
     this.sessionWatcher.onHandoff(async (sessionId, slackContext) => {
@@ -453,7 +461,7 @@ export class SlackHandler {
           this.todoMessages.delete(sessionKey);
           this.originalMessages.delete(sessionKey);
           this.currentReactions.delete(sessionKey);
-        }, 5 * 60 * 1000); // 5 minutes
+        }, SESSION_CLEANUP_DELAY_MS);
       }
     }
   }
@@ -888,8 +896,7 @@ export class SlackHandler {
       }
 
       // Format sessions list with interactive buttons
-      const maxSessions = 10; // Limit to avoid message overflow
-      const displaySessions = sessions.slice(0, maxSessions);
+      const displaySessions = sessions.slice(0, MAX_DISPLAYED_SESSIONS);
 
       let message = `📋 *Available Sessions* for \`${workingDirectory}\`\n\n`;
 
@@ -898,8 +905,8 @@ export class SlackHandler {
         message += `${i + 1}. ${this.sessionDiscovery.formatSessionForSlack(session)}\n\n`;
       }
 
-      if (sessions.length > maxSessions) {
-        message += `\n_...and ${sessions.length - maxSessions} more sessions_\n`;
+      if (sessions.length > MAX_DISPLAYED_SESSIONS) {
+        message += `\n_...and ${sessions.length - MAX_DISPLAYED_SESSIONS} more sessions_\n`;
       }
 
       message += `\n*To resume a session:*\n`;
@@ -918,7 +925,7 @@ export class SlackHandler {
       ];
 
       // Add buttons for quick session selection (top 5)
-      const buttonSessions = displaySessions.slice(0, 5);
+      const buttonSessions = displaySessions.slice(0, MAX_SESSION_BUTTONS);
       if (buttonSessions.length > 0) {
         const buttons = buttonSessions.map((session, index) => ({
           type: 'button',
@@ -1179,10 +1186,15 @@ export class SlackHandler {
 
     // Handle bot being added to channels
     this.app.event('member_joined_channel', async ({ event, say }: any) => {
-      // Check if the bot was added to the channel
-      if (event.user === await this.getBotUserId()) {
-        this.logger.info('Bot added to channel', { channel: event.channel });
-        await this.handleChannelJoin(event.channel, say);
+      try {
+        // Check if the bot was added to the channel
+        const botUserId = await this.getBotUserId();
+        if (event.user === botUserId) {
+          this.logger.info('Bot added to channel', { channel: event.channel });
+          await this.handleChannelJoin(event.channel, say);
+        }
+      } catch (error) {
+        this.logger.error('Error handling member_joined_channel event', error);
       }
     });
 
@@ -1294,9 +1306,40 @@ export class SlackHandler {
     }
 
     // Cleanup inactive sessions periodically
-    setInterval(() => {
+    this.cleanupInterval = setInterval(() => {
       this.logger.debug('Running session cleanup');
       this.claudeHandler.cleanupInactiveSessions();
-    }, 5 * 60 * 1000); // Every 5 minutes
+    }, CLEANUP_INTERVAL_MS);
+  }
+
+  /**
+   * Shutdown the handler and cleanup resources
+   * Call this when the application is shutting down
+   */
+  shutdown(): void {
+    this.logger.info('Shutting down SlackHandler');
+
+    // Stop the session watcher
+    this.sessionWatcher.stop();
+
+    // Clear the cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+
+    // Abort any active requests
+    for (const [sessionKey, controller] of this.activeControllers) {
+      this.logger.debug('Aborting active request', { sessionKey });
+      controller.abort();
+    }
+    this.activeControllers.clear();
+
+    // Clear maps
+    this.todoMessages.clear();
+    this.originalMessages.clear();
+    this.currentReactions.clear();
+
+    this.logger.info('SlackHandler shutdown complete');
   }
 }

@@ -1,6 +1,5 @@
 import winston from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
-import { config } from './config.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -11,9 +10,12 @@ const __dirname = dirname(__filename);
 // Create logs directory if it doesn't exist
 const logsDir = path.join(dirname(__dirname), 'logs');
 
+// Check debug mode directly from env vars (avoids config initialization dependency)
+const isDebug = process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development';
+
 // Configure the Winston logger
 const winstonLogger = winston.createLogger({
-  level: config.debug ? 'debug' : 'info',
+  level: isDebug ? 'debug' : 'info',
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
     winston.format.errors({ stack: true }),

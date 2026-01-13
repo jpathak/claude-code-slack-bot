@@ -128,9 +128,29 @@ async function start() {
     if (crashInfo && config.selfDebugOnCrash) {
       // Delay slightly to ensure Slack connection is fully established
       setTimeout(() => {
-        handleSelfDebugging(app, slackHandler, crashInfo);
+        handleSelfDebugging(app, slackHandler, crashInfo).catch((err) => {
+          logger.error('Self-debugging failed', err);
+        });
       }, 2000);
     }
+
+    // Setup graceful shutdown handlers
+    const shutdown = async (signal: string) => {
+      logger.info(`Received ${signal}, shutting down gracefully...`);
+
+      // Shutdown the Slack handler (stops watchers, clears intervals, aborts requests)
+      slackHandler.shutdown();
+
+      // Stop the Slack app
+      await app.stop();
+
+      logger.info('Shutdown complete');
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+
   } catch (error) {
     logger.error('Failed to start the bot', error);
     process.exit(1);

@@ -95,6 +95,11 @@ export class ClaudeHandler {
 
     this.logger.debug('Claude query options', options);
 
+    // Pass abort signal to CLI wrapper for proper process cleanup
+    if (abortController) {
+      options.abortSignal = abortController.signal;
+    }
+
     try {
       // Use CLI wrapper instead of SDK (SDK hangs due to compatibility issues)
       for await (const message of this.cliWrapper.streamQuery(prompt, options)) {
