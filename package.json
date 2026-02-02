@@ -22,7 +22,7 @@
     "vitest": "^4.0.16"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "^1.0.128",
+    "@anthropic-ai/claude-code": "^2.1.29",
     "@modelcontextprotocol/sdk": "^1.13.2",
     "@slack/bolt": "^4.4.0",
     "@types/node-fetch": "^2.6.12",
