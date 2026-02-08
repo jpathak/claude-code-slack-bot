@@ -19,6 +19,7 @@ export interface Config {
   baseDirectory: string;
   debug: boolean;
   selfDebugOnCrash: boolean;
+  defaultVerbosity: 'minimal' | 'normal' | 'verbose';
 }
 
 // Validate required environment variables before creating config
@@ -55,6 +56,9 @@ function createConfig(): Config {
     baseDirectory: process.env.BASE_DIRECTORY || '',
     debug: process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development',
     selfDebugOnCrash: process.env.SELF_DEBUG_ON_CRASH !== 'false',
+    defaultVerbosity: (['minimal', 'normal', 'verbose'].includes(process.env.DEFAULT_VERBOSITY || '')
+      ? process.env.DEFAULT_VERBOSITY as 'minimal' | 'normal' | 'verbose'
+      : 'normal'),
   };
 }
 

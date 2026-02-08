@@ -19,3 +19,13 @@ export interface WorkingDirectoryConfig {
   directory: string;
   setAt: Date;
 }
+
+export type VerbosityLevel = 'minimal' | 'normal' | 'verbose';
+
+export interface VerbosityConfig {
+  channelId: string;
+  threadTs?: string;
+  userId?: string;
+  level: VerbosityLevel;
+  setAt: Date;
+}

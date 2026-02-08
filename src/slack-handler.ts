@@ -14,6 +14,28 @@ import { permissionServer } from './permission-mcp-server.js';
 import { config } from './config.js';
 import { SessionDiscovery, SessionInfo } from './session-discovery.js';
 import { SessionWatcher } from './session-watcher.js';
+import { VerbosityManager } from './verbosity-manager.js';
+import { VerbosityLevel } from './types.js';
+
+// Tool activity tracker for summarizing work done
+export interface ToolActivityTracker {
+  reads: number;
+  edits: number;
+  writes: number;
+  bashes: number;
+  others: number;
+  toolNames: Set<string>;
+}
+
+export function formatToolSummary(tracker: ToolActivityTracker): string {
+  const parts: string[] = [];
+  if (tracker.reads > 0) parts.push(`Read ${tracker.reads} file${tracker.reads > 1 ? 's' : ''}`);
+  if (tracker.edits > 0) parts.push(`edited ${tracker.edits} file${tracker.edits > 1 ? 's' : ''}`);
+  if (tracker.writes > 0) parts.push(`wrote ${tracker.writes} file${tracker.writes > 1 ? 's' : ''}`);
+  if (tracker.bashes > 0) parts.push(`ran ${tracker.bashes} command${tracker.bashes > 1 ? 's' : ''}`);
+  if (tracker.others > 0) parts.push(`used ${tracker.others} other tool${tracker.others > 1 ? 's' : ''}`);
+  return parts.length > 0 ? parts.join(', ') : 'no tools used';
+}
 
 // Configuration constants
 const SESSION_CLEANUP_DELAY_MS = 5 * 60 * 1000; // 5 minutes - delay before cleaning up session data
@@ -21,6 +43,7 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes - how often to run sessi
 const SESSION_WATCHER_POLL_MS = 30000; // 30 seconds - poll interval for session watcher
 const MAX_DISPLAYED_SESSIONS = 10; // Maximum sessions to display in list
 const MAX_SESSION_BUTTONS = 5; // Maximum quick-select buttons for sessions
+const STATUS_UPDATE_INTERVAL_MS = 5000; // 5 seconds - throttle periodic status updates
 
 interface MessageEvent {
   user: string;
@@ -50,6 +73,7 @@ export class SlackHandler {
   private mcpManager: McpManager;
   private sessionDiscovery: SessionDiscovery;
   private sessionWatcher: SessionWatcher;
+  private verbosityManager: VerbosityManager;
   private todoMessages: Map<string, string> = new Map(); // sessionKey -> messageTs
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
@@ -65,6 +89,7 @@ export class SlackHandler {
     this.todoManager = new TodoManager();
     this.sessionDiscovery = new SessionDiscovery();
     this.sessionWatcher = new SessionWatcher(this.sessionDiscovery, SESSION_WATCHER_POLL_MS);
+    this.verbosityManager = new VerbosityManager(config.defaultVerbosity);
 
     // Set up handoff notification callback
     this.sessionWatcher.onHandoff(async (sessionId, slackContext) => {
@@ -196,6 +221,33 @@ export class SlackHandler {
       return;
     }
 
+    // Check if this is a verbosity set command
+    if (text) {
+      const verbosityLevel = this.verbosityManager.parseSetCommand(text);
+      if (verbosityLevel) {
+        const isDM = channel.startsWith('D');
+        this.verbosityManager.setVerbosity(channel, verbosityLevel, thread_ts, isDM ? user : undefined);
+        const context = thread_ts ? 'this thread' : (isDM ? 'this conversation' : 'this channel');
+        await say({
+          text: this.verbosityManager.formatVerbosityMessage(verbosityLevel, context),
+          thread_ts: thread_ts || ts,
+        });
+        return;
+      }
+    }
+
+    // Check if this is a verbosity get command
+    if (text && this.verbosityManager.isGetCommand(text)) {
+      const isDM = channel.startsWith('D');
+      const level = this.verbosityManager.getVerbosity(channel, thread_ts, isDM ? user : undefined);
+      const context = thread_ts ? 'this thread' : (isDM ? 'this conversation' : 'this channel');
+      await say({
+        text: this.verbosityManager.formatVerbosityMessage(level, context),
+        thread_ts: thread_ts || ts,
+      });
+      return;
+    }
+
     // Check if this is a continue command
     if (text && this.isContinueCommand(text)) {
       await this.handleContinueCommand(user, channel, thread_ts, ts, text, say);
@@ -304,7 +356,22 @@ export class SlackHandler {
         threadTs: thread_ts,
         user
       };
-      
+
+      // Resolve verbosity for this context
+      const isDMForVerbosity = channel.startsWith('D');
+      const verbosity = this.verbosityManager.getVerbosity(
+        channel, thread_ts, isDMForVerbosity ? user : undefined
+      );
+
+      // Initialize tool activity tracker
+      const toolTracker: ToolActivityTracker = {
+        reads: 0, edits: 0, writes: 0, bashes: 0, others: 0,
+        toolNames: new Set<string>(),
+      };
+
+      // Track last status update time for throttling periodic updates
+      let lastStatusUpdateMs = 0;
+
       for await (const message of this.claudeHandler.streamQuery(finalPrompt, session, abortController, workingDirectory, slackContext)) {
         if (abortController.signal.aborted) break;
 
@@ -320,8 +387,38 @@ export class SlackHandler {
           const hasToolUse = content.some((part: any) => part.type === 'tool_use');
 
           if (hasToolUse) {
-            // Update status to show working
-            if (statusMessageTs) {
+            // Update reaction to show working
+            await this.updateMessageReaction(sessionKey, 'gear');
+
+            // Track tool usage for summary
+            for (const part of content) {
+              if (part.type === 'tool_use' && part.name) {
+                toolTracker.toolNames.add(part.name);
+                switch (part.name) {
+                  case 'Read': toolTracker.reads++; break;
+                  case 'Edit': case 'MultiEdit': toolTracker.edits++; break;
+                  case 'Write': toolTracker.writes++; break;
+                  case 'Bash': toolTracker.bashes++; break;
+                  case 'TodoWrite': break; // Don't count TodoWrite as "other"
+                  default: toolTracker.others++; break;
+                }
+              }
+            }
+
+            // Periodically update status message with progress summary
+            // when individual tool messages are not being shown
+            const now = Date.now();
+            if (verbosity !== 'verbose' && statusMessageTs && (now - lastStatusUpdateMs) >= STATUS_UPDATE_INTERVAL_MS) {
+              lastStatusUpdateMs = now;
+              const progressSummary = formatToolSummary(toolTracker);
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: `⚙️ *Working...* (${progressSummary})`,
+              });
+            } else if (lastStatusUpdateMs === 0 && statusMessageTs) {
+              // First tool use — update from "Thinking" to "Working"
+              lastStatusUpdateMs = now;
               await this.app.client.chat.update({
                 channel,
                 ts: statusMessageTs,
@@ -329,38 +426,40 @@ export class SlackHandler {
               });
             }
 
-            // Update reaction to show working
-            await this.updateMessageReaction(sessionKey, 'gear');
-
             // Check for TodoWrite tool and handle it specially
             const todoTool = content.find((part: any) =>
               part.type === 'tool_use' && part.name === 'TodoWrite'
             );
 
-            if (todoTool) {
+            // Only show todo updates in normal and verbose modes
+            if (todoTool && verbosity !== 'minimal') {
               await this.handleTodoUpdate(todoTool.input, sessionKey, session?.sessionId, channel, thread_ts || ts, say);
             }
 
-            // For other tool use messages, format them immediately as new messages
-            const toolContent = this.formatToolUse(content);
-            if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
-              await say({
-                text: toolContent,
-                thread_ts: thread_ts || ts,
-              });
+            // Only send individual tool use messages in verbose mode
+            if (verbosity === 'verbose') {
+              const toolContent = this.formatToolUse(content);
+              if (toolContent) {
+                await say({
+                  text: toolContent,
+                  thread_ts: thread_ts || ts,
+                });
+              }
             }
           } else {
             // Handle regular text content
             const content = this.extractTextContent(message);
             if (content) {
               currentMessages.push(content);
-              
-              // Send each new piece of content as a separate message
-              const formatted = this.formatMessage(content, false);
-              await say({
-                text: formatted,
-                thread_ts: thread_ts || ts,
-              });
+
+              // Only send intermediate text in normal and verbose modes
+              if (verbosity !== 'minimal') {
+                const formatted = this.formatMessage(content, false);
+                await say({
+                  text: formatted,
+                  thread_ts: thread_ts || ts,
+                });
+              }
             }
           }
         } else if (message.type === 'result') {
@@ -370,7 +469,8 @@ export class SlackHandler {
             totalCost: (message as any).total_cost_usd,
             duration: (message as any).duration_ms,
           });
-          
+
+          // Final result is always sent regardless of verbosity
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
@@ -384,13 +484,41 @@ export class SlackHandler {
         }
       }
 
-      // Update status to completed
-      if (statusMessageTs) {
-        await this.app.client.chat.update({
-          channel,
-          ts: statusMessageTs,
-          text: '✅ *Task completed*',
+      // Build completion status based on verbosity
+      const toolSummaryStr = formatToolSummary(toolTracker);
+      const hasToolActivity = toolTracker.toolNames.size > 0;
+
+      if (verbosity === 'minimal' && hasToolActivity) {
+        // In minimal mode, append tool summary to the status line
+        if (statusMessageTs) {
+          await this.app.client.chat.update({
+            channel,
+            ts: statusMessageTs,
+            text: `✅ *Done* — ${toolSummaryStr}`,
+          });
+        }
+      } else if (verbosity === 'normal' && hasToolActivity) {
+        // In normal mode, update status and send a consolidated summary message
+        if (statusMessageTs) {
+          await this.app.client.chat.update({
+            channel,
+            ts: statusMessageTs,
+            text: '✅ *Task completed*',
+          });
+        }
+        await say({
+          text: `🔧 *Tools used:* ${toolSummaryStr}`,
+          thread_ts: thread_ts || ts,
         });
+      } else {
+        // In verbose mode (or no tool activity), just mark completed
+        if (statusMessageTs) {
+          await this.app.client.chat.update({
+            channel,
+            ts: statusMessageTs,
+            text: '✅ *Task completed*',
+          });
+        }
       }
 
       // Update reaction to show completion
