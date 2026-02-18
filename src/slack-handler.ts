@@ -16,6 +16,10 @@ import { SessionDiscovery, SessionInfo } from './session-discovery.js';
 import { SessionWatcher } from './session-watcher.js';
 import { VerbosityManager } from './verbosity-manager.js';
 import { VerbosityLevel } from './types.js';
+import { KanbanManager } from './kanban-manager.js';
+import { ProjectConfig } from './project-config.js';
+import { ChannelProvisioner } from './channel-provisioner.js';
+import { TaskPlanner } from './task-planner.js';
 
 // Tool activity tracker for summarizing work done
 export interface ToolActivityTracker {
@@ -74,6 +78,10 @@ export class SlackHandler {
   private sessionDiscovery: SessionDiscovery;
   private sessionWatcher: SessionWatcher;
   private verbosityManager: VerbosityManager;
+  private kanbanManager: KanbanManager | null = null;
+  private projectConfig: ProjectConfig | null = null;
+  private channelProvisioner: ChannelProvisioner | null = null;
+  private taskPlanner: TaskPlanner = new TaskPlanner();
   private todoMessages: Map<string, string> = new Map(); // sessionKey -> messageTs
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
@@ -98,6 +106,20 @@ export class SlackHandler {
 
     // Start the session watcher
     this.sessionWatcher.start();
+  }
+
+  /**
+   * Set kanban-related dependencies.
+   * Called after construction when kanban is enabled.
+   */
+  setKanbanDependencies(
+    kanbanManager: KanbanManager,
+    projectConfig: ProjectConfig,
+    channelProvisioner: ChannelProvisioner,
+  ): void {
+    this.kanbanManager = kanbanManager;
+    this.projectConfig = projectConfig;
+    this.channelProvisioner = channelProvisioner;
   }
 
   /**
@@ -248,6 +270,15 @@ export class SlackHandler {
       return;
     }
 
+    // Check if this is a kanban command
+    if (text && this.kanbanManager) {
+      const kanbanCmd = this.kanbanManager.parseCommand(text);
+      if (kanbanCmd) {
+        await this.handleKanbanCommand(kanbanCmd, channel, thread_ts || ts, say);
+        return;
+      }
+    }
+
     // Check if this is a continue command
     if (text && this.isContinueCommand(text)) {
       await this.handleContinueCommand(user, channel, thread_ts, ts, text, say);
@@ -262,11 +293,28 @@ export class SlackHandler {
 
     // Check if we have a working directory set
     const isDM = channel.startsWith('D');
-    const workingDirectory = this.workingDirManager.getWorkingDirectory(
+    let workingDirectory = this.workingDirManager.getExplicitWorkingDirectory(
       channel,
       thread_ts,
       isDM ? user : undefined
     );
+
+    // Fallback: check project config for auto-provisioned channels
+    if (!workingDirectory && this.projectConfig) {
+      const mapping = this.projectConfig.getByChannelId(channel);
+      if (mapping) {
+        workingDirectory = mapping.projectPath;
+      }
+    }
+
+    // Final fallback: base directory
+    if (!workingDirectory) {
+      workingDirectory = this.workingDirManager.getWorkingDirectory(
+        channel,
+        thread_ts,
+        isDM ? user : undefined
+      );
+    }
 
     // Working directory is always required
     if (!workingDirectory) {
@@ -838,6 +886,14 @@ export class SlackHandler {
     await this.updateMessageReaction(sessionKey, emoji);
   }
 
+  /**
+   * Check if a channel is an auto-provisioned project channel.
+   */
+  private isProjectChannel(channelId: string): boolean {
+    if (!this.projectConfig) return false;
+    return !!this.projectConfig.getByChannelId(channelId);
+  }
+
   private isMcpInfoCommand(text: string): boolean {
     return /^(mcp|servers?)(\s+(info|list|status))?(\?)?$/i.test(text.trim());
   }
@@ -1092,6 +1148,398 @@ export class SlackHandler {
     }
   }
 
+  private async handleKanbanCommand(
+    cmd: import('./types.js').KanbanCommand,
+    channel: string,
+    threadTs: string,
+    say: any,
+  ): Promise<void> {
+    if (!this.kanbanManager) return;
+
+    try {
+      switch (cmd.type) {
+        case 'board': {
+          const items = this.kanbanManager.listItems(channel);
+          await say({
+            text: this.kanbanManager.formatBoard(items),
+            thread_ts: threadTs,
+          });
+          break;
+        }
+
+        case 'add': {
+          const item = await this.kanbanManager.addItem(channel, cmd.title, 'backlog', 'user');
+          await say({
+            text: this.kanbanManager.formatItemCreated(item),
+            thread_ts: threadTs,
+          });
+
+          // Automatically trigger planning: move to planning, send to Claude for AC generation
+          this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
+            this.logger.error('Auto-planning failed', { itemId: item.id, error: err });
+          });
+          break;
+        }
+
+        case 'done': {
+          const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, 'done');
+          if (item) {
+            await say({
+              text: this.kanbanManager.formatItemMoved(item),
+              thread_ts: threadTs,
+            });
+          } else {
+            await say({
+              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
+              thread_ts: threadTs,
+            });
+          }
+          break;
+        }
+
+        case 'move': {
+          const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, cmd.status);
+          if (item) {
+            await say({
+              text: this.kanbanManager.formatItemMoved(item),
+              thread_ts: threadTs,
+            });
+
+            // Trigger semi-autonomous workflows based on destination status
+            if (cmd.status === 'planning') {
+              this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
+                this.logger.error('Auto-planning failed after move', { itemId: item.id, error: err });
+              });
+            } else if (cmd.status === 'in_progress') {
+              this.triggerTaskImplementation(channel, item.id, threadTs, say).catch(err => {
+                this.logger.error('Auto-implementation failed after move', { itemId: item.id, error: err });
+              });
+            }
+          } else {
+            await say({
+              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
+              thread_ts: threadTs,
+            });
+          }
+          break;
+        }
+
+        case 'go': {
+          const store = this.kanbanManager.getStore(channel);
+          const goItem = store.findItem(cmd.ref);
+          if (goItem) {
+            store.moveItem(goItem.id, 'in_progress');
+            await say({
+              text: `🚀 Task *#${goItem.id}* approved for implementation! Moving to *In Progress*: ${goItem.title}`,
+              thread_ts: threadTs,
+            });
+
+            // Send the task to Claude for implementation
+            this.triggerTaskImplementation(channel, goItem.id, threadTs, say).catch(err => {
+              this.logger.error('Task implementation trigger failed', { itemId: goItem.id, error: err });
+            });
+          } else {
+            await say({
+              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
+              thread_ts: threadTs,
+            });
+          }
+          break;
+        }
+
+        case 'answer': {
+          const store = this.kanbanManager.getStore(channel);
+          const found = store.findItem(cmd.ref);
+          if (found) {
+            // Clear questions and move back to planning
+            const updated = store.updateItem(found.id, {
+              questions: [],
+              status: 'planning',
+              description: (found.description || '') + `\n\n**Answer:** ${cmd.response}`,
+            });
+            if (updated) {
+              await say({
+                text: `💬 Answer recorded for task *#${updated.id}*. Moving back to *Planning*.\n> ${cmd.response}`,
+                thread_ts: threadTs,
+              });
+            }
+          } else {
+            await say({
+              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
+              thread_ts: threadTs,
+            });
+          }
+          break;
+        }
+
+        case 'approve': {
+          const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, 'done');
+          if (item) {
+            await say({
+              text: `✅ Task *#${item.id}* approved and marked *Done*: ${item.title}`,
+              thread_ts: threadTs,
+            });
+          } else {
+            await say({
+              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
+              thread_ts: threadTs,
+            });
+          }
+          break;
+        }
+
+        case 'sync': {
+          if (this.channelProvisioner) {
+            await say({
+              text: '🔄 Syncing projects...',
+              thread_ts: threadTs,
+            });
+            const result = await this.channelProvisioner.syncAll();
+            await say({
+              text: `✅ Sync complete: ${result.scanned} scanned, ${result.created} created, ${result.adopted} adopted, ${result.skipped} skipped` +
+                (result.errors.length > 0 ? `\n⚠️ Errors: ${result.errors.join('; ')}` : ''),
+              thread_ts: threadTs,
+            });
+          } else {
+            await say({
+              text: '❌ Channel provisioner not configured.',
+              thread_ts: threadTs,
+            });
+          }
+          break;
+        }
+      }
+    } catch (error) {
+      this.logger.error('Error handling kanban command', { cmd, error });
+      await say({
+        text: `❌ Error: ${(error as Error).message}`,
+        thread_ts: threadTs,
+      });
+    }
+  }
+
+  /**
+   * Public: handle a status transition triggered externally (e.g. from web UI via board API).
+   * Posts updates to the project's Slack channel.
+   */
+  async handleExternalStatusTransition(
+    channelId: string,
+    itemId: string,
+    newStatus: string,
+    projectPath: string,
+  ): Promise<void> {
+    if (newStatus === 'planning') {
+      // Post to channel and trigger planning
+      const result = await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `📐 Task *#${itemId}* moved to *Planning* (via board). Starting auto-planning...`,
+      });
+      const threadTs = result.ts!;
+      const say = async (msg: { text: string; thread_ts?: string }) => {
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: msg.thread_ts,
+          text: msg.text,
+        });
+      };
+      await this.triggerTaskPlanning(channelId, itemId, threadTs, say);
+    } else if (newStatus === 'in_progress') {
+      const result = await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `🚀 Task *#${itemId}* moved to *In Progress* (via board). Starting implementation...`,
+      });
+      const threadTs = result.ts!;
+      const say = async (msg: { text: string; thread_ts?: string }) => {
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: msg.thread_ts,
+          text: msg.text,
+        });
+      };
+      await this.triggerTaskImplementation(channelId, itemId, threadTs, say);
+    }
+  }
+
+  /**
+   * Trigger automatic task planning via Claude.
+   * Sends a planning prompt to Claude, saves specs, and applies the result.
+   */
+  private async triggerTaskPlanning(
+    channel: string,
+    itemId: string,
+    threadTs: string,
+    say: any,
+  ): Promise<void> {
+    if (!this.kanbanManager) return;
+
+    const store = this.kanbanManager.getStore(channel);
+    const planResult = await this.taskPlanner.processNewTask(store, itemId);
+    if (!planResult) return;
+
+    await say({
+      text: `📐 Planning task *#${planResult.item.id}*: generating acceptance criteria...`,
+      thread_ts: threadTs,
+    });
+
+    const mapping = this.projectConfig?.getByChannelId(channel);
+    const workingDirectory = mapping?.projectPath;
+
+    const planningUser = 'SYSTEM_PLANNER';
+    const session = this.claudeHandler.createSession(planningUser, channel, threadTs);
+
+    let planningOutput = '';
+    const abortController = new AbortController();
+
+    try {
+      for await (const message of this.claudeHandler.streamQuery(
+        planResult.planningPrompt,
+        session,
+        abortController,
+        workingDirectory,
+      )) {
+        if (message.type === 'assistant' && message.message) {
+          const content = message.message.content || [];
+          for (const part of content) {
+            if ((part as any).type === 'text' && (part as any).text) {
+              planningOutput += (part as any).text;
+            }
+          }
+        } else if (message.type === 'result' && message.subtype === 'success' && (message as any).result) {
+          // Claude may put the final planning output in the result message
+          const resultText = (message as any).result;
+          if (typeof resultText === 'string' && resultText.trim()) {
+            // Use result text if it contains the planning sections we need
+            if (resultText.includes('## Acceptance Criteria') || resultText.includes('## Questions')) {
+              planningOutput = resultText;
+            } else if (!planningOutput.trim()) {
+              // Fallback: use result if we have no output yet
+              planningOutput = resultText;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.error('Planning query failed', { itemId, error: err });
+      await say({
+        text: `⚠️ Auto-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    if (!planningOutput.trim()) {
+      this.logger.warn('Planning returned empty output', { itemId });
+      return;
+    }
+
+    // Apply planning result (this also saves the spec to .specs/<id>/plan.md)
+    const updated = await this.taskPlanner.applyPlanningResult(store, itemId, planningOutput);
+    if (!updated) return;
+
+    if (updated.status === 'clarification_needed' && updated.questions?.length) {
+      const questionList = updated.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
+      await say({
+        text: `❓ Task *#${updated.id}* needs clarification:\n${questionList}\n\nReply with \`answer ${updated.id} <your response>\` or answer in the web board.`,
+        thread_ts: threadTs,
+      });
+    } else {
+      const acCount = updated.acceptanceCriteria?.length ?? 0;
+      const specPath = workingDirectory ? `.specs/${updated.id}/plan.md` : '';
+      await say({
+        text: `✅ Task *#${updated.id}* is *Ready to Execute* with ${acCount} acceptance criteria.${specPath ? ` Spec saved to \`${specPath}\`.` : ''}\nUse \`go ${updated.id}\` to start implementation.`,
+        thread_ts: threadTs,
+      });
+    }
+  }
+
+  /**
+   * Trigger task implementation via Claude.
+   * Uses spec context, saves implementation notes, moves to review when done.
+   */
+  private async triggerTaskImplementation(
+    channel: string,
+    itemId: string,
+    threadTs: string,
+    say: any,
+  ): Promise<void> {
+    if (!this.kanbanManager) return;
+
+    const store = this.kanbanManager.getStore(channel);
+    const item = store.findItem(itemId);
+    if (!item) return;
+
+    const mapping = this.projectConfig?.getByChannelId(channel);
+    const workingDirectory = mapping?.projectPath;
+
+    // Build implementation prompt using TaskPlanner (includes spec context)
+    const implementPrompt = workingDirectory
+      ? this.taskPlanner.generateImplementationPrompt(item, workingDirectory)
+      : `Implement task #${item.id}: "${item.title}"\n${item.description || ''}\n\nPlease implement this task fully.`;
+
+    // Inject board context
+    const boardData = store.load();
+    const boardContext = this.taskPlanner.generateBoardContext(boardData);
+    const fullPrompt = `${boardContext}\n\n${implementPrompt}`;
+
+    const implUser = 'SYSTEM_IMPL';
+    const session = this.claudeHandler.createSession(implUser, channel, threadTs);
+
+    await say({
+      text: `⚙️ Claude is now implementing task *#${item.id}*...`,
+      thread_ts: threadTs,
+    });
+
+    const abortController = new AbortController();
+    let lastTextOutput = '';
+
+    try {
+      for await (const message of this.claudeHandler.streamQuery(
+        fullPrompt,
+        session,
+        abortController,
+        workingDirectory,
+      )) {
+        if (message.type === 'assistant' && message.message) {
+          const content = message.message.content || [];
+          for (const part of content) {
+            if ((part as any).type === 'text' && (part as any).text) {
+              lastTextOutput += (part as any).text;
+            }
+          }
+        } else if (message.type === 'result' && message.subtype === 'success' && (message as any).result) {
+          const resultText = (message as any).result;
+          if (typeof resultText === 'string' && resultText.trim()) {
+            lastTextOutput += '\n\n' + resultText;
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.error('Implementation query failed', { itemId, error: err });
+      await say({
+        text: `⚠️ Implementation of task *#${item.id}* encountered an error: ${(err as Error).message || 'Unknown error'}`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Save implementation notes to spec dir
+    if (workingDirectory && lastTextOutput.trim()) {
+      this.taskPlanner.saveImplementationSpec(workingDirectory, item, lastTextOutput);
+    }
+
+    // Move to review
+    store.moveItem(item.id, 'review');
+
+    const summary = lastTextOutput.length > 500
+      ? lastTextOutput.substring(0, 500) + '...'
+      : lastTextOutput;
+
+    await say({
+      text: `👀 Task *#${item.id}* implementation complete! Moved to *Review*.\n\n${summary ? `> ${summary.split('\n').join('\n> ')}` : ''}\n\nUse \`approve ${item.id}\` to mark as done.`,
+      thread_ts: threadTs,
+    });
+  }
+
   private formatTimeAgo(date: Date): string {
     const now = new Date();
     const diffMs = now.getTime() - date.getTime();
@@ -1128,10 +1576,22 @@ export class SlackHandler {
       });
 
       const channelName = (channelInfo.channel as any)?.name || 'this channel';
-      
+
+      // Check if this is an auto-provisioned project channel
+      if (this.projectConfig) {
+        const mapping = this.projectConfig.getByChannelId(channelId);
+        if (mapping) {
+          await say({
+            text: `👋 Hi! This channel is auto-mapped to \`${mapping.projectPath}\`.\n\nJust start chatting - no \`cwd\` needed!\n\nCommands: \`board\` (kanban), \`add task <desc>\`, \`done <ref>\`, \`sync\``,
+          });
+          this.logger.info('Sent provisioned welcome to channel', { channelId, channelName });
+          return;
+        }
+      }
+
       let welcomeMessage = `👋 Hi! I'm Claude Code, your AI coding assistant.\n\n`;
       welcomeMessage += `To get started, I need to know the default working directory for #${channelName}.\n\n`;
-      
+
       if (config.baseDirectory) {
         welcomeMessage += `You can use:\n`;
         welcomeMessage += `• \`cwd project-name\` (relative to base directory: \`${config.baseDirectory}\`)\n`;
@@ -1140,7 +1600,7 @@ export class SlackHandler {
         welcomeMessage += `Please set it using:\n`;
         welcomeMessage += `• \`cwd /path/to/project\` or \`set directory /path/to/project\`\n\n`;
       }
-      
+
       welcomeMessage += `This will be the default working directory for this channel. `;
       welcomeMessage += `You can always override it for specific threads by mentioning me with a different \`cwd\` command.\n\n`;
       welcomeMessage += `Once set, you can ask me to help with code reviews, file analysis, debugging, and more!`;
@@ -1285,16 +1745,38 @@ export class SlackHandler {
   }
 
   setupEventHandlers() {
-    // Handle direct messages
+    // Handle direct messages and channel messages
     this.app.message(async ({ message, say }: any) => {
-      if (message.subtype === undefined && 'user' in message) {
+      if (message.subtype !== undefined || !('user' in message)) return;
+
+      const channelId = message.channel;
+      const isDM = channelId?.startsWith('D');
+
+      if (isDM) {
+        // DMs: always respond
         this.logger.info('Handling direct message event');
         await this.handleMessage(message as MessageEvent, say);
+      } else if (this.isProjectChannel(channelId)) {
+        // Project channels: respond without @mention
+        const botUserId = await this.getBotUserId();
+        if (message.user === botUserId) return; // Ignore own messages
+
+        this.logger.info('Handling project channel message', { channel: channelId });
+        // Strip any @mention if present
+        const text = message.text?.replace(/<@[^>]+>/g, '').trim();
+        await this.handleMessage({
+          ...message,
+          text,
+        } as MessageEvent, say);
       }
+      // Non-project channels: ignore (handled by app_mention below)
     });
 
-    // Handle app mentions
+    // Handle app mentions (for non-project channels)
     this.app.event('app_mention', async ({ event, say }: any) => {
+      // Skip if this is a project channel (already handled by app.message above)
+      if (this.isProjectChannel(event.channel)) return;
+
       this.logger.info('Handling app mention event');
       const text = event.text.replace(/<@[^>]+>/g, '').trim();
       await this.handleMessage({

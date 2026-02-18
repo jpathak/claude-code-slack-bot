@@ -6,6 +6,11 @@ import { SlackHandler } from './slack-handler.js';
 import { McpManager } from './mcp-manager.js';
 import { Logger } from './logger.js';
 import { CrashDetector, CrashInfo } from './crash-detector.js';
+import { ProjectConfig } from './project-config.js';
+import { KanbanManager } from './kanban-manager.js';
+import { ChannelProvisioner } from './channel-provisioner.js';
+import { WorkingDirectoryManager } from './working-directory-manager.js';
+import { BoardApiServer } from './board-api.js';
 
 const logger = new Logger('Main');
 const crashDetector = new CrashDetector();
@@ -104,11 +109,59 @@ async function start() {
     const claudeHandler = new ClaudeHandler(mcpManager);
     const slackHandler = new SlackHandler(app, claudeHandler, mcpManager);
 
+    // Initialize kanban/project components if enabled
+    let channelProvisioner: ChannelProvisioner | null = null;
+    let projectConfig: ProjectConfig | null = null;
+    let boardApiServer: BoardApiServer | null = null;
+
+    if (config.kanban.enabled) {
+      projectConfig = new ProjectConfig();
+      const kanbanManager = new KanbanManager(app, projectConfig);
+
+      // We need a reference to the WorkingDirectoryManager inside SlackHandler.
+      // Since SlackHandler creates its own, we create a shared one and pass it
+      // via the kanban dependencies. The provisioner uses it to set cwds.
+      const sharedWorkingDirManager = new WorkingDirectoryManager();
+      channelProvisioner = new ChannelProvisioner(app, projectConfig, sharedWorkingDirManager, kanbanManager);
+
+      // Wire up kanban dependencies into the SlackHandler
+      slackHandler.setKanbanDependencies(kanbanManager, projectConfig, channelProvisioner);
+
+      logger.info('Kanban system initialized', {
+        autoProvision: config.kanban.autoProvision,
+        channelPrefix: config.kanban.channelPrefix,
+      });
+    }
+
     // Setup event handlers
     slackHandler.setupEventHandlers();
 
     // Start the app
     await app.start();
+
+    // Start Board API server if enabled
+    if (config.boardApi.enabled && projectConfig) {
+      boardApiServer = new BoardApiServer(projectConfig);
+
+      // Wire status transition callbacks: when a task is moved via the web UI,
+      // trigger the semi-autonomous workflow (planning / implementation) in Slack.
+      boardApiServer.onStatusTransition((projectId, itemId, oldStatus, newStatus, projectPath) => {
+        slackHandler.handleExternalStatusTransition(projectId, itemId, newStatus, projectPath).catch(err => {
+          logger.error('Error handling external status transition', { projectId, itemId, newStatus, error: err });
+        });
+      });
+
+      try {
+        await boardApiServer.start(config.boardApi.port);
+        logger.info('Board API server running', { port: config.boardApi.port });
+      } catch (err) {
+        logger.error('Failed to start Board API server', err);
+        boardApiServer = null;
+      }
+    } else if (config.boardApi.enabled && !projectConfig) {
+      // Board API requires kanban to be enabled (for ProjectConfig)
+      logger.warn('Board API enabled but kanban is disabled. Skipping Board API server start.');
+    }
 
     // Record successful startup
     crashDetector.recordStartup();
@@ -120,9 +173,24 @@ async function start() {
       usingAnthropicAPI: !config.claude.useBedrock && !config.claude.useVertex,
       debugMode: config.debug,
       baseDirectory: config.baseDirectory || 'not set',
+      kanbanEnabled: config.kanban.enabled,
+      autoProvision: config.kanban.autoProvision,
+      boardApiEnabled: config.boardApi.enabled,
+      boardApiPort: config.boardApi.port,
       mcpServers: mcpConfig ? Object.keys(mcpConfig.mcpServers).length : 0,
       mcpServerNames: mcpConfig ? Object.keys(mcpConfig.mcpServers) : [],
     });
+
+    // Run channel provisioning sync after Slack connection is established
+    if (channelProvisioner && config.kanban.autoProvision) {
+      setTimeout(() => {
+        channelProvisioner!.syncAll().then((result) => {
+          logger.info('Channel provisioning sync completed', result);
+        }).catch((err) => {
+          logger.error('Channel provisioning sync failed', err);
+        });
+      }, 3000);
+    }
 
     // Initiate self-debugging if there was a crash and it's enabled
     if (crashInfo && config.selfDebugOnCrash) {
@@ -137,6 +205,15 @@ async function start() {
     // Setup graceful shutdown handlers
     const shutdown = async (signal: string) => {
       logger.info(`Received ${signal}, shutting down gracefully...`);
+
+      // Stop the Board API server
+      if (boardApiServer) {
+        try {
+          await boardApiServer.stop();
+        } catch (err) {
+          logger.error('Error stopping Board API server during shutdown', err);
+        }
+      }
 
       // Shutdown the Slack handler (stops watchers, clears intervals, aborts requests)
       slackHandler.shutdown();

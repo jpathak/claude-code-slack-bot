@@ -20,6 +20,15 @@ export interface Config {
   debug: boolean;
   selfDebugOnCrash: boolean;
   defaultVerbosity: 'minimal' | 'normal' | 'verbose';
+  kanban: {
+    enabled: boolean;
+    autoProvision: boolean;
+    channelPrefix: string;
+  };
+  boardApi: {
+    port: number;
+    enabled: boolean;
+  };
 }
 
 // Validate required environment variables before creating config
@@ -59,6 +68,15 @@ function createConfig(): Config {
     defaultVerbosity: (['minimal', 'normal', 'verbose'].includes(process.env.DEFAULT_VERBOSITY || '')
       ? process.env.DEFAULT_VERBOSITY as 'minimal' | 'normal' | 'verbose'
       : 'normal'),
+    kanban: {
+      enabled: process.env.KANBAN_ENABLED !== 'false',
+      autoProvision: process.env.AUTO_PROVISION_CHANNELS !== 'false',
+      channelPrefix: process.env.CHANNEL_PREFIX || 'proj-',
+    },
+    boardApi: {
+      port: parseInt(process.env.BOARD_API_PORT || '7000', 10),
+      enabled: process.env.BOARD_API_ENABLED !== 'false',
+    },
   };
 }
 

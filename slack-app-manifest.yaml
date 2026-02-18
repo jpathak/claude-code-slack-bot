@@ -16,6 +16,8 @@ oauth_config:
     bot:
       - app_mentions:read
       - channels:history
+      - channels:manage
+      - channels:read
       - chat:write
       - chat:write.public
       - im:history
@@ -24,10 +26,14 @@ oauth_config:
       - users:read
       - reactions:read
       - reactions:write
+      - lists:read
+      - lists:write
+      - bookmarks:write
 settings:
   event_subscriptions:
     bot_events:
       - app_mention
+      - message.channels
       - message.im
       - member_joined_channel
   interactivity:

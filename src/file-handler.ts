@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawn } from 'child_process';
 import { Logger } from './logger.js';
 import { config } from './config.js';
 
@@ -15,8 +16,142 @@ export interface ProcessedFile {
   tempPath?: string;
 }
 
+// Maximum image dimensions for Claude API (8192x8192 is the limit)
+const MAX_IMAGE_DIMENSION = 4096; // Use conservative limit to avoid issues
+
 export class FileHandler {
   private logger = new Logger('FileHandler');
+
+  /**
+   * Preprocess an image to ensure compatibility with Claude's API.
+   * Uses macOS `sips` command to:
+   * - Convert HEIC/HEIF to PNG
+   * - Resize large images
+   * - Normalize color profiles
+   */
+  private async preprocessImage(imagePath: string, mimetype: string): Promise<string> {
+    const needsConversion = mimetype === 'image/heic' ||
+                           mimetype === 'image/heif' ||
+                           mimetype === 'image/tiff' ||
+                           mimetype.includes('heic') ||
+                           mimetype.includes('heif');
+
+    // Generate output path (always convert to PNG for consistency)
+    const outputPath = imagePath.replace(/\.[^.]+$/, '.png');
+
+    try {
+      // First, get image dimensions to check if resize is needed
+      const dimensions = await this.getImageDimensions(imagePath);
+
+      if (dimensions) {
+        this.logger.debug('Image dimensions', {
+          path: imagePath,
+          width: dimensions.width,
+          height: dimensions.height
+        });
+      }
+
+      // Determine if we need to process the image
+      const needsResize = dimensions &&
+        (dimensions.width > MAX_IMAGE_DIMENSION || dimensions.height > MAX_IMAGE_DIMENSION);
+
+      if (!needsConversion && !needsResize && mimetype === 'image/png') {
+        // Image is already PNG and within size limits, no processing needed
+        return imagePath;
+      }
+
+      // Use sips to convert and/or resize the image
+      const args: string[] = [];
+
+      // Set format to PNG
+      args.push('-s', 'format', 'png');
+
+      // Resize if needed (maintain aspect ratio by setting max dimension)
+      if (needsResize) {
+        const maxDim = Math.max(dimensions!.width, dimensions!.height);
+        const scale = MAX_IMAGE_DIMENSION / maxDim;
+        const newWidth = Math.floor(dimensions!.width * scale);
+        const newHeight = Math.floor(dimensions!.height * scale);
+        args.push('-z', String(newHeight), String(newWidth));
+        this.logger.info('Resizing image', {
+          from: `${dimensions!.width}x${dimensions!.height}`,
+          to: `${newWidth}x${newHeight}`
+        });
+      }
+
+      // Output path
+      args.push('--out', outputPath);
+
+      // Input path
+      args.push(imagePath);
+
+      await this.runCommand('sips', args);
+
+      this.logger.info('Image preprocessed successfully', {
+        input: imagePath,
+        output: outputPath,
+        converted: needsConversion,
+        resized: needsResize
+      });
+
+      return outputPath;
+    } catch (error) {
+      this.logger.warn('Image preprocessing failed, using original', {
+        path: imagePath,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      // Return original path if preprocessing fails
+      return imagePath;
+    }
+  }
+
+  /**
+   * Get image dimensions using sips
+   */
+  private async getImageDimensions(imagePath: string): Promise<{ width: number; height: number } | null> {
+    try {
+      const output = await this.runCommand('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', imagePath]);
+
+      const widthMatch = output.match(/pixelWidth:\s*(\d+)/);
+      const heightMatch = output.match(/pixelHeight:\s*(\d+)/);
+
+      if (widthMatch && heightMatch) {
+        return {
+          width: parseInt(widthMatch[1], 10),
+          height: parseInt(heightMatch[1], 10)
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Run a command and return its output
+   */
+  private runCommand(command: string, args: string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(command, args);
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (data) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve(stdout);
+        } else {
+          reject(new Error(`Command failed with code ${code}: ${stderr}`));
+        }
+      });
+
+      proc.on('error', (err) => {
+        reject(err);
+      });
+    });
+  }
 
   async downloadAndProcessFiles(files: any[]): Promise<ProcessedFile[]> {
     const processedFiles: ProcessedFile[] = [];
