@@ -279,6 +279,20 @@ export class SlackHandler {
       }
     }
 
+    // Check if this is a thread reply for a task waiting for clarification
+    if (text && thread_ts && this.kanbanManager) {
+      const clarificationTask = this.findTaskWaitingForClarificationInThread(channel, thread_ts);
+      if (clarificationTask) {
+        this.logger.info('Detected thread reply for task waiting clarification', {
+          taskId: clarificationTask.id,
+          threadTs: thread_ts,
+        });
+        // Handle this as an answer to the clarification questions
+        await this.handleClarificationReply(channel, clarificationTask, text, thread_ts, say);
+        return;
+      }
+    }
+
     // Check if this is a continue command
     if (text && this.isContinueCommand(text)) {
       await this.handleContinueCommand(user, channel, thread_ts, ts, text, say);
@@ -1198,6 +1212,9 @@ export class SlackHandler {
         }
 
         case 'move': {
+          // Capture old status before the move for re-entry detection
+          const preMove = this.kanbanManager.getStore(channel).findItem(cmd.ref);
+          const oldMoveStatus = preMove?.status;
           const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, cmd.status);
           if (item) {
             await say({
@@ -1210,8 +1227,16 @@ export class SlackHandler {
               this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
                 this.logger.error('Auto-planning failed after move', { itemId: item.id, error: err });
               });
+            } else if (cmd.status === 'ready') {
+              // Task moved to "ready" - prompt user to approve with "go" command
+              await say({
+                text: `📋 Task *#${item.id}* is ready for implementation. Use \`go ${item.id}\` to approve and start.`,
+                thread_ts: threadTs,
+              });
             } else if (cmd.status === 'in_progress') {
-              this.triggerTaskImplementation(channel, item.id, threadTs, say).catch(err => {
+              // Direct move to in_progress triggers implementation
+              const isRetry = oldMoveStatus === 'review';
+              this.triggerTaskImplementation(channel, item.id, threadTs, say, isRetry).catch(err => {
                 this.logger.error('Auto-implementation failed after move', { itemId: item.id, error: err });
               });
             }
@@ -1228,14 +1253,17 @@ export class SlackHandler {
           const store = this.kanbanManager.getStore(channel);
           const goItem = store.findItem(cmd.ref);
           if (goItem) {
+            const isRetry = goItem.status === 'review';
             store.moveItem(goItem.id, 'in_progress');
+            const emoji = isRetry ? '🔄' : '🚀';
+            const label = isRetry ? 'Retrying implementation' : 'Approved for implementation! Moving to *In Progress*';
             await say({
-              text: `🚀 Task *#${goItem.id}* approved for implementation! Moving to *In Progress*: ${goItem.title}`,
+              text: `${emoji} Task *#${goItem.id}* ${label}: ${goItem.title}`,
               thread_ts: threadTs,
             });
 
             // Send the task to Claude for implementation
-            this.triggerTaskImplementation(channel, goItem.id, threadTs, say).catch(err => {
+            this.triggerTaskImplementation(channel, goItem.id, threadTs, say, isRetry).catch(err => {
               this.logger.error('Task implementation trigger failed', { itemId: goItem.id, error: err });
             });
           } else {
@@ -1256,11 +1284,17 @@ export class SlackHandler {
               questions: [],
               status: 'planning',
               description: (found.description || '') + `\n\n**Answer:** ${cmd.response}`,
+              clarificationThreadTs: undefined, // Clear the thread association
             });
             if (updated) {
               await say({
-                text: `💬 Answer recorded for task *#${updated.id}*. Moving back to *Planning*.\n> ${cmd.response}`,
+                text: `💬 Answer recorded for task *#${updated.id}*. Re-planning with new context...\n> ${cmd.response}`,
                 thread_ts: threadTs,
+              });
+
+              // Re-trigger planning with auto-implementation if no more questions
+              this.triggerTaskPlanningWithAutoImplement(channel, updated.id, threadTs, say).catch(err => {
+                this.logger.error('Re-planning failed after answer', { itemId: updated.id, error: err });
               });
             }
           } else {
@@ -1319,44 +1353,97 @@ export class SlackHandler {
   }
 
   /**
-   * Public: handle a status transition triggered externally (e.g. from web UI via board API).
-   * Posts updates to the project's Slack channel.
+   * Public: handle a status transition triggered externally (e.g. from web UI via board API or Trello).
+   * Posts updates to the project's Slack channel and triggers appropriate workflows.
    */
   async handleExternalStatusTransition(
     channelId: string,
     itemId: string,
     newStatus: string,
     projectPath: string,
+    oldStatus?: string,
   ): Promise<void> {
+    const makeSay = (channelId: string, threadTs: string) => {
+      return async (msg: { text: string; thread_ts?: string }) => {
+        return await this.app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: msg.thread_ts ?? threadTs,
+          text: msg.text,
+        });
+      };
+    };
+
+    this.logger.info('handleExternalStatusTransition called', {
+      channelId, itemId, newStatus, oldStatus, projectPath,
+    });
+
     if (newStatus === 'planning') {
-      // Post to channel and trigger planning
       const result = await this.app.client.chat.postMessage({
         channel: channelId,
         text: `📐 Task *#${itemId}* moved to *Planning* (via board). Starting auto-planning...`,
       });
       const threadTs = result.ts!;
-      const say = async (msg: { text: string; thread_ts?: string }) => {
+      await this.triggerTaskPlanning(channelId, itemId, threadTs, makeSay(channelId, threadTs));
+    } else if (newStatus === 'clarification_needed') {
+      // Task moved to clarification_needed via board - post the questions if available
+      if (!this.kanbanManager) return;
+      const store = this.kanbanManager.getStore(channelId);
+      const item = store.findItem(itemId);
+      if (item && item.questions && item.questions.length > 0) {
+        const questionList = item.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
+        const result = await this.app.client.chat.postMessage({
+          channel: channelId,
+          text: `❓ Task *#${itemId}* moved to *Clarification Needed* (via board):\n${questionList}\n\nReply in this thread with your answers.`,
+        });
+        // Track the thread for clarification replies
+        if (result.ts) {
+          store.updateItem(itemId, { clarificationThreadTs: result.ts });
+        }
+      } else {
         await this.app.client.chat.postMessage({
           channel: channelId,
-          thread_ts: msg.thread_ts,
-          text: msg.text,
+          text: `❓ Task *#${itemId}* moved to *Clarification Needed* (via board). Reply with clarification when ready.`,
         });
-      };
-      await this.triggerTaskPlanning(channelId, itemId, threadTs, say);
+      }
+    } else if (newStatus === 'ready') {
+      // Task moved to "ready" via board - prompt user to approve
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `📋 Task *#${itemId}* moved to *Ready to Execute* (via board). Use \`go ${itemId}\` to approve and start implementation.`,
+      });
     } else if (newStatus === 'in_progress') {
+      // Direct move to in_progress via board triggers implementation
+      const isRetry = oldStatus === 'review';
+      const wasWaitingClarification = oldStatus === 'clarification_needed';
+      let label = 'Starting implementation';
+      let emoji = '🚀';
+
+      if (isRetry) {
+        label = 'Retrying implementation';
+        emoji = '🔄';
+      } else if (wasWaitingClarification) {
+        label = 'Starting implementation (clarification bypassed)';
+        emoji = '⏭️';
+      }
+
       const result = await this.app.client.chat.postMessage({
         channel: channelId,
-        text: `🚀 Task *#${itemId}* moved to *In Progress* (via board). Starting implementation...`,
+        text: `${emoji} Task *#${itemId}* moved to *In Progress* (via board). ${label}...`,
       });
       const threadTs = result.ts!;
-      const say = async (msg: { text: string; thread_ts?: string }) => {
-        await this.app.client.chat.postMessage({
-          channel: channelId,
-          thread_ts: msg.thread_ts,
-          text: msg.text,
-        });
-      };
-      await this.triggerTaskImplementation(channelId, itemId, threadTs, say);
+      await this.triggerTaskImplementation(channelId, itemId, threadTs, makeSay(channelId, threadTs), isRetry);
+    } else if (newStatus === 'review') {
+      // Task moved to review via board (e.g., manual completion)
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `👀 Task *#${itemId}* moved to *Review* (via board). Use \`approve ${itemId}\` to mark as done.`,
+      });
+    } else if (newStatus === 'done') {
+      // Task marked as done via board
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `✅ Task *#${itemId}* marked as *Done* (via board).`,
+      });
     }
   }
 
@@ -1389,6 +1476,16 @@ export class SlackHandler {
 
     let planningOutput = '';
     const abortController = new AbortController();
+    const tracker: ToolActivityTracker = { reads: 0, edits: 0, writes: 0, bashes: 0, others: 0, toolNames: new Set() };
+    let statusMessageTs: string | undefined;
+    let lastStatusUpdateMs = 0;
+
+    // Post initial status message that we'll update with progress
+    const statusResult = await say({
+      text: '🤔 *Analyzing task...*',
+      thread_ts: threadTs,
+    });
+    statusMessageTs = statusResult?.ts;
 
     try {
       for await (const message of this.claudeHandler.streamQuery(
@@ -1399,20 +1496,55 @@ export class SlackHandler {
       )) {
         if (message.type === 'assistant' && message.message) {
           const content = message.message.content || [];
+          const hasToolUse = content.some((part: any) => part.type === 'tool_use');
+
+          if (hasToolUse) {
+            // Track tool usage
+            for (const part of content) {
+              if (part.type === 'tool_use' && (part as any).name) {
+                const name = (part as any).name;
+                tracker.toolNames.add(name);
+                switch (name) {
+                  case 'Read': tracker.reads++; break;
+                  case 'Edit': case 'MultiEdit': tracker.edits++; break;
+                  case 'Write': tracker.writes++; break;
+                  case 'Bash': tracker.bashes++; break;
+                  default: tracker.others++; break;
+                }
+              }
+            }
+
+            // Update progress status periodically
+            const now = Date.now();
+            if (statusMessageTs && (now - lastStatusUpdateMs) >= STATUS_UPDATE_INTERVAL_MS) {
+              lastStatusUpdateMs = now;
+              const progress = formatToolSummary(tracker);
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: `⚙️ *Planning...* (${progress})`,
+              });
+            } else if (lastStatusUpdateMs === 0 && statusMessageTs) {
+              lastStatusUpdateMs = now;
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: '⚙️ *Exploring codebase...*',
+              });
+            }
+          }
+
           for (const part of content) {
             if ((part as any).type === 'text' && (part as any).text) {
               planningOutput += (part as any).text;
             }
           }
         } else if (message.type === 'result' && message.subtype === 'success' && (message as any).result) {
-          // Claude may put the final planning output in the result message
           const resultText = (message as any).result;
           if (typeof resultText === 'string' && resultText.trim()) {
-            // Use result text if it contains the planning sections we need
             if (resultText.includes('## Acceptance Criteria') || resultText.includes('## Questions')) {
               planningOutput = resultText;
             } else if (!planningOutput.trim()) {
-              // Fallback: use result if we have no output yet
               planningOutput = resultText;
             }
           }
@@ -1420,11 +1552,20 @@ export class SlackHandler {
       }
     } catch (err) {
       this.logger.error('Planning query failed', { itemId, error: err });
+      if (statusMessageTs) {
+        await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '❌ *Planning failed*' });
+      }
       await say({
         text: `⚠️ Auto-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}`,
         thread_ts: threadTs,
       });
       return;
+    }
+
+    // Update status to done
+    if (statusMessageTs) {
+      const progress = tracker.toolNames.size > 0 ? ` — ${formatToolSummary(tracker)}` : '';
+      await this.app.client.chat.update({ channel, ts: statusMessageTs, text: `✅ *Planning complete*${progress}` });
     }
 
     if (!planningOutput.trim()) {
@@ -1437,18 +1578,23 @@ export class SlackHandler {
     if (!updated) return;
 
     if (updated.status === 'clarification_needed' && updated.questions?.length) {
+      // Track the thread where clarification is being requested
+      store.updateItem(updated.id, { clarificationThreadTs: threadTs });
+
       const questionList = updated.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
       await say({
-        text: `❓ Task *#${updated.id}* needs clarification:\n${questionList}\n\nReply with \`answer ${updated.id} <your response>\` or answer in the web board.`,
+        text: `❓ Task *#${updated.id}* needs clarification:\n${questionList}\n\nReply in this thread with your answers, or use \`answer ${updated.id} <your response>\`.`,
         thread_ts: threadTs,
       });
     } else {
       const acCount = updated.acceptanceCriteria?.length ?? 0;
       const specPath = workingDirectory ? `.specs/${updated.id}/plan.md` : '';
+      // Task stays in "ready" state - user must explicitly approve with "go" command
       await say({
-        text: `✅ Task *#${updated.id}* is *Ready to Execute* with ${acCount} acceptance criteria.${specPath ? ` Spec saved to \`${specPath}\`.` : ''}\nUse \`go ${updated.id}\` to start implementation.`,
+        text: `✅ Task *#${updated.id}* is *Ready to Execute* with ${acCount} acceptance criteria.${specPath ? ` Spec saved to \`${specPath}\`.` : ''}\n\n*Review the plan, then use \`go ${updated.id}\` to start implementation.*`,
         thread_ts: threadTs,
       });
+      // Note: Task remains in "ready" state. User must explicitly run "go <id>" to approve and start implementation.
     }
   }
 
@@ -1461,6 +1607,7 @@ export class SlackHandler {
     itemId: string,
     threadTs: string,
     say: any,
+    isRetry: boolean = false,
   ): Promise<void> {
     if (!this.kanbanManager) return;
 
@@ -1472,9 +1619,14 @@ export class SlackHandler {
     const workingDirectory = mapping?.projectPath;
 
     // Build implementation prompt using TaskPlanner (includes spec context)
-    const implementPrompt = workingDirectory
-      ? this.taskPlanner.generateImplementationPrompt(item, workingDirectory)
-      : `Implement task #${item.id}: "${item.title}"\n${item.description || ''}\n\nPlease implement this task fully.`;
+    let implementPrompt: string;
+    if (isRetry && workingDirectory) {
+      implementPrompt = this.taskPlanner.generateRetryImplementationPrompt(item, workingDirectory);
+    } else if (workingDirectory) {
+      implementPrompt = this.taskPlanner.generateImplementationPrompt(item, workingDirectory);
+    } else {
+      implementPrompt = `Implement task #${item.id}: "${item.title}"\n${item.description || ''}\n\nPlease implement this task fully.`;
+    }
 
     // Inject board context
     const boardData = store.load();
@@ -1484,13 +1636,18 @@ export class SlackHandler {
     const implUser = 'SYSTEM_IMPL';
     const session = this.claudeHandler.createSession(implUser, channel, threadTs);
 
-    await say({
-      text: `⚙️ Claude is now implementing task *#${item.id}*...`,
-      thread_ts: threadTs,
-    });
-
     const abortController = new AbortController();
     let lastTextOutput = '';
+    const tracker: ToolActivityTracker = { reads: 0, edits: 0, writes: 0, bashes: 0, others: 0, toolNames: new Set() };
+    let statusMessageTs: string | undefined;
+    let lastStatusUpdateMs = 0;
+
+    // Post status message that we'll update with progress
+    const statusResult = await say({
+      text: `⚙️ *Implementing task #${item.id}...*`,
+      thread_ts: threadTs,
+    });
+    statusMessageTs = statusResult?.ts;
 
     try {
       for await (const message of this.claudeHandler.streamQuery(
@@ -1501,6 +1658,56 @@ export class SlackHandler {
       )) {
         if (message.type === 'assistant' && message.message) {
           const content = message.message.content || [];
+          const hasToolUse = content.some((part: any) => part.type === 'tool_use');
+
+          if (hasToolUse) {
+            // Track tool usage
+            for (const part of content) {
+              if (part.type === 'tool_use' && (part as any).name) {
+                const name = (part as any).name;
+                tracker.toolNames.add(name);
+                switch (name) {
+                  case 'Read': tracker.reads++; break;
+                  case 'Edit': case 'MultiEdit': tracker.edits++; break;
+                  case 'Write': tracker.writes++; break;
+                  case 'Bash': tracker.bashes++; break;
+                  default: tracker.others++; break;
+                }
+              }
+            }
+
+            // Update progress status periodically
+            const now = Date.now();
+            if (statusMessageTs && (now - lastStatusUpdateMs) >= STATUS_UPDATE_INTERVAL_MS) {
+              lastStatusUpdateMs = now;
+              const progress = formatToolSummary(tracker);
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: `⚙️ *Implementing task #${item.id}...* (${progress})`,
+              });
+            } else if (lastStatusUpdateMs === 0 && statusMessageTs) {
+              lastStatusUpdateMs = now;
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: `⚙️ *Implementing task #${item.id}...* (working)`,
+              });
+            }
+          } else {
+            // Post text responses to the thread so user can follow along
+            const textParts = content
+              .filter((part: any) => part.type === 'text' && part.text)
+              .map((part: any) => part.text);
+            const textContent = textParts.join('');
+            if (textContent.trim()) {
+              await say({
+                text: this.formatMessage(textContent, false),
+                thread_ts: threadTs,
+              });
+            }
+          }
+
           for (const part of content) {
             if ((part as any).type === 'text' && (part as any).text) {
               lastTextOutput += (part as any).text;
@@ -1515,6 +1722,9 @@ export class SlackHandler {
       }
     } catch (err) {
       this.logger.error('Implementation query failed', { itemId, error: err });
+      if (statusMessageTs) {
+        await this.app.client.chat.update({ channel, ts: statusMessageTs, text: `❌ *Implementation of task #${item.id} failed*` });
+      }
       await say({
         text: `⚠️ Implementation of task *#${item.id}* encountered an error: ${(err as Error).message || 'Unknown error'}`,
         thread_ts: threadTs,
@@ -1530,12 +1740,18 @@ export class SlackHandler {
     // Move to review
     store.moveItem(item.id, 'review');
 
-    const summary = lastTextOutput.length > 500
-      ? lastTextOutput.substring(0, 500) + '...'
-      : lastTextOutput;
+    // Update status message with final summary
+    const toolSummary = tracker.toolNames.size > 0 ? ` — ${formatToolSummary(tracker)}` : '';
+    if (statusMessageTs) {
+      await this.app.client.chat.update({
+        channel,
+        ts: statusMessageTs,
+        text: `✅ *Task #${item.id} implementation complete*${toolSummary}`,
+      });
+    }
 
     await say({
-      text: `👀 Task *#${item.id}* implementation complete! Moved to *Review*.\n\n${summary ? `> ${summary.split('\n').join('\n> ')}` : ''}\n\nUse \`approve ${item.id}\` to mark as done.`,
+      text: `👀 Task *#${item.id}* moved to *Review*. Use \`approve ${item.id}\` to mark as done.`,
       thread_ts: threadTs,
     });
   }
@@ -1553,6 +1769,222 @@ export class SlackHandler {
     if (diffDays < 7) return `${diffDays} days ago`;
 
     return date.toLocaleDateString();
+  }
+
+  /**
+   * Find a task that is waiting for clarification in a specific thread.
+   * Returns the task if found, null otherwise.
+   */
+  private findTaskWaitingForClarificationInThread(
+    channel: string,
+    threadTs: string,
+  ): import('./types.js').KanbanItem | null {
+    if (!this.kanbanManager) return null;
+
+    const store = this.kanbanManager.getStore(channel);
+    const items = store.getItems();
+
+    // Find a task in clarification_needed state that is associated with this thread
+    const clarificationTask = items.find(
+      item => item.status === 'clarification_needed' && item.clarificationThreadTs === threadTs
+    );
+
+    return clarificationTask || null;
+  }
+
+  /**
+   * Handle a thread reply as a clarification answer for a task.
+   * Records the answer, clears questions, and re-triggers planning.
+   * If re-planning yields no more questions, automatically starts implementation.
+   */
+  private async handleClarificationReply(
+    channel: string,
+    task: import('./types.js').KanbanItem,
+    answerText: string,
+    threadTs: string,
+    say: any,
+  ): Promise<void> {
+    if (!this.kanbanManager) return;
+
+    const store = this.kanbanManager.getStore(channel);
+
+    // Clear questions, append answer to description, and move back to planning
+    const updated = store.updateItem(task.id, {
+      questions: [],
+      status: 'planning',
+      description: (task.description || '') + `\n\n**Answer:** ${answerText}`,
+      clarificationThreadTs: undefined, // Clear the thread association
+    });
+
+    if (updated) {
+      await say({
+        text: `💬 Answer recorded for task *#${updated.id}*. Re-planning with new context...`,
+        thread_ts: threadTs,
+      });
+
+      // Re-trigger planning with the new answer context
+      // After re-planning completes, if no more questions, auto-start implementation
+      this.triggerTaskPlanningWithAutoImplement(channel, updated.id, threadTs, say).catch(err => {
+        this.logger.error('Re-planning failed after thread reply', { itemId: updated.id, error: err });
+      });
+    }
+  }
+
+  /**
+   * Trigger planning and automatically start implementation if no questions remain.
+   * Used after clarification is provided to streamline the workflow.
+   */
+  private async triggerTaskPlanningWithAutoImplement(
+    channel: string,
+    itemId: string,
+    threadTs: string,
+    say: any,
+  ): Promise<void> {
+    if (!this.kanbanManager) return;
+
+    const store = this.kanbanManager.getStore(channel);
+    const planResult = await this.taskPlanner.processNewTask(store, itemId);
+    if (!planResult) return;
+
+    await say({
+      text: `📐 Re-planning task *#${planResult.item.id}* with clarification...`,
+      thread_ts: threadTs,
+    });
+
+    const mapping = this.projectConfig?.getByChannelId(channel);
+    const workingDirectory = mapping?.projectPath;
+
+    const planningUser = 'SYSTEM_PLANNER';
+    const session = this.claudeHandler.createSession(planningUser, channel, threadTs);
+
+    let planningOutput = '';
+    const abortController = new AbortController();
+    const tracker: ToolActivityTracker = { reads: 0, edits: 0, writes: 0, bashes: 0, others: 0, toolNames: new Set() };
+    let statusMessageTs: string | undefined;
+    let lastStatusUpdateMs = 0;
+
+    // Post initial status message that we'll update with progress
+    const statusResult = await say({
+      text: '🤔 *Analyzing with clarification...*',
+      thread_ts: threadTs,
+    });
+    statusMessageTs = statusResult?.ts;
+
+    try {
+      for await (const message of this.claudeHandler.streamQuery(
+        planResult.planningPrompt,
+        session,
+        abortController,
+        workingDirectory,
+      )) {
+        if (message.type === 'assistant' && message.message) {
+          const content = message.message.content || [];
+          const hasToolUse = content.some((part: any) => part.type === 'tool_use');
+
+          if (hasToolUse) {
+            // Track tool usage
+            for (const part of content) {
+              if (part.type === 'tool_use' && (part as any).name) {
+                const name = (part as any).name;
+                tracker.toolNames.add(name);
+                switch (name) {
+                  case 'Read': tracker.reads++; break;
+                  case 'Edit': case 'MultiEdit': tracker.edits++; break;
+                  case 'Write': tracker.writes++; break;
+                  case 'Bash': tracker.bashes++; break;
+                  default: tracker.others++; break;
+                }
+              }
+            }
+
+            // Update progress status periodically
+            const now = Date.now();
+            if (statusMessageTs && (now - lastStatusUpdateMs) >= STATUS_UPDATE_INTERVAL_MS) {
+              lastStatusUpdateMs = now;
+              const progress = formatToolSummary(tracker);
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: `⚙️ *Re-planning...* (${progress})`,
+              });
+            } else if (lastStatusUpdateMs === 0 && statusMessageTs) {
+              lastStatusUpdateMs = now;
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: '⚙️ *Exploring codebase...*',
+              });
+            }
+          }
+
+          for (const part of content) {
+            if ((part as any).type === 'text' && (part as any).text) {
+              planningOutput += (part as any).text;
+            }
+          }
+        } else if (message.type === 'result' && message.subtype === 'success' && (message as any).result) {
+          const resultText = (message as any).result;
+          if (typeof resultText === 'string' && resultText.trim()) {
+            if (resultText.includes('## Acceptance Criteria') || resultText.includes('## Questions')) {
+              planningOutput = resultText;
+            } else if (!planningOutput.trim()) {
+              planningOutput = resultText;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.error('Re-planning query failed', { itemId, error: err });
+      if (statusMessageTs) {
+        await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '❌ *Re-planning failed*' });
+      }
+      await say({
+        text: `⚠️ Re-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Update status to done
+    if (statusMessageTs) {
+      const progress = tracker.toolNames.size > 0 ? ` — ${formatToolSummary(tracker)}` : '';
+      await this.app.client.chat.update({ channel, ts: statusMessageTs, text: `✅ *Re-planning complete*${progress}` });
+    }
+
+    if (!planningOutput.trim()) {
+      this.logger.warn('Re-planning returned empty output', { itemId });
+      return;
+    }
+
+    // Apply planning result (this also saves the spec to .specs/<id>/plan.md)
+    const updated = await this.taskPlanner.applyPlanningResult(store, itemId, planningOutput);
+    if (!updated) return;
+
+    if (updated.status === 'clarification_needed' && updated.questions?.length) {
+      // Still has questions - need more clarification
+      store.updateItem(updated.id, { clarificationThreadTs: threadTs });
+
+      const questionList = updated.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
+      await say({
+        text: `❓ Task *#${updated.id}* still needs clarification:\n${questionList}\n\nReply in this thread with your answers.`,
+        thread_ts: threadTs,
+      });
+    } else {
+      // No more questions! Auto-start implementation instead of waiting for manual "go"
+      const acCount = updated.acceptanceCriteria?.length ?? 0;
+      const specPath = workingDirectory ? `.specs/${updated.id}/plan.md` : '';
+
+      await say({
+        text: `✅ Task *#${updated.id}* clarification complete with ${acCount} acceptance criteria.${specPath ? ` Spec saved to \`${specPath}\`.` : ''}\n\n🚀 *Auto-starting implementation...*`,
+        thread_ts: threadTs,
+      });
+
+      // Move to in_progress and start implementation automatically
+      store.moveItem(updated.id, 'in_progress');
+      this.triggerTaskImplementation(channel, updated.id, threadTs, say, false).catch(err => {
+        this.logger.error('Auto-implementation failed after clarification', { itemId: updated.id, error: err });
+      });
+    }
   }
 
   private async getBotUserId(): Promise<string> {

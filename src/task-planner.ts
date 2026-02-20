@@ -163,6 +163,51 @@ export class TaskPlanner {
   }
 
   /**
+   * Generate a retry implementation prompt when a task is moved back from review to in_progress.
+   * Includes the previous implementation notes so Claude knows what was already tried.
+   */
+  generateRetryImplementationPrompt(item: KanbanItem, projectPath: string): string {
+    const acSection = item.acceptanceCriteria?.length
+      ? '\n\nAcceptance Criteria:\n' + item.acceptanceCriteria.map(ac => `- [ ] ${ac}`).join('\n')
+      : '';
+    const descSection = item.description ? `\n\nDescription: ${item.description}` : '';
+
+    // Include spec context
+    const planSpec = this.readSpec(projectPath, item.id, 'plan.md');
+    const specSection = planSpec
+      ? `\n\nPlanning Spec (from .specs/${item.id}/plan.md):\n${planSpec}`
+      : '';
+
+    // Include previous implementation notes
+    const implSpec = this.readSpec(projectPath, item.id, 'implementation.md');
+    const prevImplSection = implSpec
+      ? `\n\n--- PREVIOUS IMPLEMENTATION ATTEMPT ---\nThe following implementation was attempted but moved back from review because it did not fully work:\n\n${implSpec}\n--- END PREVIOUS ATTEMPT ---`
+      : '';
+
+    return [
+      `RETRY implementation of task #${item.id}: "${item.title}"`,
+      '',
+      'IMPORTANT: This task was previously implemented but the result was not satisfactory.',
+      'It has been moved back from Review to In Progress, which means the previous approach had issues.',
+      'You MUST:',
+      '1. Read the previous implementation attempt below to understand what was already tried',
+      '2. Investigate what went wrong with the previous approach',
+      '3. Take a different or deeper approach to fix the remaining issues',
+      '4. Do NOT simply repeat the same changes',
+      descSection,
+      acSection,
+      specSection,
+      prevImplSection,
+      '',
+      'When done:',
+      '1. Explain what was wrong with the previous attempt',
+      '2. Describe what you changed and why this approach is better',
+      '3. Verify against each acceptance criterion',
+      `4. Your updated implementation notes will be saved to .specs/${item.id}/implementation.md`,
+    ].join('\n');
+  }
+
+  /**
    * Parse Claude's planning output to extract acceptance criteria, questions, and subtasks.
    */
   parsePlanningOutput(output: string): {

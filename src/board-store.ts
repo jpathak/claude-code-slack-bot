@@ -120,6 +120,7 @@ export class BoardStore {
     data.items.push(item);
     this.save(data);
     this.logger.info('Added board item', { projectPath: this.projectPath, item: { id: item.id, title: item.title } });
+    this.notifyChanged();
     return item;
   }
 
@@ -142,6 +143,7 @@ export class BoardStore {
 
     this.save(data);
     this.logger.info('Updated board item', { id, updates: Object.keys(updates) });
+    this.notifyChanged();
     return item;
   }
 
@@ -163,6 +165,7 @@ export class BoardStore {
     data.items.splice(index, 1);
     this.save(data);
     this.logger.info('Deleted board item', { id });
+    this.notifyChanged();
     return true;
   }
 
@@ -201,14 +204,29 @@ export class BoardStore {
   }
 
   /**
-   * Register a callback for when the board file changes externally.
+   * Register a callback for when the board file changes (internally or externally).
    */
   onChanged(callback: () => void): void {
     this.changeCallbacks.push(callback);
 
-    // Start watching if not already
-    if (!this.watcher && fs.existsSync(this.boardFile)) {
+    // Start watching if not already (watch the directory, which must exist)
+    if (!this.watcher && fs.existsSync(this.boardDir)) {
       this.startWatching();
+    }
+  }
+
+  /**
+   * Notify all registered callbacks that the board has changed.
+   * This is called internally after modifications and can also be called externally.
+   */
+  notifyChanged(): void {
+    this.logger.debug('Notifying change callbacks', { callbackCount: this.changeCallbacks.length });
+    for (const cb of this.changeCallbacks) {
+      try {
+        cb();
+      } catch (err) {
+        this.logger.warn('Error in change callback', { error: err });
+      }
     }
   }
 
@@ -218,28 +236,41 @@ export class BoardStore {
   private startWatching(): void {
     if (this.watcher) return;
 
+    // Watch the directory instead of the file directly, because save() uses
+    // atomic writes (write tmp + rename).  On macOS, renaming a file into the
+    // watched path emits a 'rename' event which was previously ignored.
+    // Watching the directory reliably catches both direct writes and renames.
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
     try {
-      this.watcher = fs.watch(this.boardFile, (eventType) => {
-        if (eventType !== 'change') return;
+      this.watcher = fs.watch(this.boardDir, (eventType, filename) => {
+        // Only care about changes to our board file
+        if (filename !== 'board.json') return;
 
-        // Check if this was our own write
-        try {
-          const content = fs.readFileSync(this.boardFile, 'utf-8');
-          const hash = crypto.createHash('md5').update(content).digest('hex');
-          if (hash === this.lastWriteHash) return;
-        } catch {
-          return;
-        }
+        // Debounce: atomic rename can fire multiple events
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          debounceTimer = null;
 
-        this.logger.debug('Board file changed externally', { path: this.boardFile });
-        for (const cb of this.changeCallbacks) {
-          try { cb(); } catch (err) {
-            this.logger.warn('Error in change callback', { error: err });
+          // Check if this was our own write
+          try {
+            const content = fs.readFileSync(this.boardFile, 'utf-8');
+            const hash = crypto.createHash('md5').update(content).digest('hex');
+            if (hash === this.lastWriteHash) return;
+          } catch {
+            return;
           }
-        }
+
+          this.logger.debug('Board file changed externally', { path: this.boardFile });
+          for (const cb of this.changeCallbacks) {
+            try { cb(); } catch (err) {
+              this.logger.warn('Error in change callback', { error: err });
+            }
+          }
+        }, 100);
       });
     } catch (error) {
-      this.logger.warn('Failed to watch board file', { path: this.boardFile, error });
+      this.logger.warn('Failed to watch board directory', { path: this.boardDir, error });
     }
   }
 

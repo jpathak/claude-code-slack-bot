@@ -29,6 +29,12 @@ export interface Config {
     port: number;
     enabled: boolean;
   };
+  trello: {
+    enabled: boolean;
+    apiKey: string;
+    token: string;
+    pollIntervalMs: number;
+  };
 }
 
 // Validate required environment variables before creating config
@@ -76,6 +82,12 @@ function createConfig(): Config {
     boardApi: {
       port: parseInt(process.env.BOARD_API_PORT || '7000', 10),
       enabled: process.env.BOARD_API_ENABLED !== 'false',
+    },
+    trello: {
+      enabled: process.env.TRELLO_ENABLED === 'true',
+      apiKey: process.env.TRELLO_API_KEY || '',
+      token: process.env.TRELLO_TOKEN || '',
+      pollIntervalMs: parseInt(process.env.TRELLO_POLL_INTERVAL_MS || '30000', 10),
     },
   };
 }

@@ -334,6 +334,72 @@ describe('BoardStore', () => {
     });
   });
 
+  describe('file watcher (directory-based)', () => {
+    it('should detect external writes via atomic rename', async () => {
+      // Initialize the board so the .kanban dir exists
+      store.load();
+
+      let changeDetected = false;
+      store.onChanged(() => {
+        changeDetected = true;
+      });
+
+      // Give the watcher time to initialize fully
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Simulate an external write using the same atomic pattern (tmp + rename)
+      // This tests the fix for macOS where rename events were previously missed
+      const boardFile = store.getBoardFilePath();
+      const data = store.load();
+      data.items.push({
+        id: '999',
+        title: 'External item',
+        status: 'backlog',
+        source: 'user',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      } as any);
+      data.updatedAt = new Date().toISOString();
+      const content = JSON.stringify(data, null, 2);
+
+      // Write to temp file then rename (atomic write pattern)
+      const tmpFile = boardFile + '.ext-tmp';
+      fs.writeFileSync(tmpFile, content, 'utf-8');
+      fs.renameSync(tmpFile, boardFile);
+
+      // Wait for the debounce (100ms) + generous buffer for CI/slow systems
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      expect(changeDetected).toBe(true);
+    });
+
+    it('should fire callback for own writes (for Trello sync)', async () => {
+      store.load();
+
+      let changeDetected = false;
+      store.onChanged(() => {
+        changeDetected = true;
+      });
+
+      // Internal writes via the store's methods should fire callbacks
+      // to trigger outbound sync (e.g., Trello sync)
+      store.addItem({ title: 'Self-written item' });
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      expect(changeDetected).toBe(true);
+    });
+
+    it('should watch the directory not the file', () => {
+      store.load();
+      store.onChanged(() => {});
+
+      // The watcher should be active (we can verify by checking dispose doesn't error)
+      // The key behavioral test is the atomic rename detection above
+      store.dispose();
+    });
+  });
+
   describe('dispose', () => {
     it('should clean up watcher and callbacks', () => {
       // Register a change callback to start the watcher

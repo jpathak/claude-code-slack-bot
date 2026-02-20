@@ -14,6 +14,7 @@ export interface ProcessedFile {
   isText: boolean;
   size: number;
   tempPath?: string;
+  preprocessedPath?: string;
 }
 
 // Maximum image dimensions for Claude API (8192x8192 is the limit)
@@ -196,21 +197,36 @@ export class FileHandler {
       
       fs.writeFileSync(tempPath, buffer);
 
+      const isImage = this.isImageFile(file.mimetype);
+      let finalPath = tempPath;
+
+      // Preprocess images to ensure compatibility with Claude's API
+      if (isImage) {
+        finalPath = await this.preprocessImage(tempPath, file.mimetype);
+      }
+
       const processed: ProcessedFile = {
-        path: tempPath,
+        path: finalPath,
         name: file.name,
-        mimetype: file.mimetype,
-        isImage: this.isImageFile(file.mimetype),
+        mimetype: (isImage && finalPath !== tempPath) ? 'image/png' : file.mimetype,
+        isImage,
         isText: this.isTextFile(file.mimetype),
         size: file.size,
-        tempPath,
+        tempPath, // keep original temp path for cleanup
       };
+
+      // Track preprocessed file for cleanup if different from original
+      if (finalPath !== tempPath) {
+        processed.preprocessedPath = finalPath;
+      }
 
       this.logger.info('File downloaded successfully', {
         name: file.name,
         tempPath,
+        finalPath,
         isImage: processed.isImage,
         isText: processed.isText,
+        preprocessed: finalPath !== tempPath,
       });
 
       return processed;
@@ -286,6 +302,15 @@ export class FileHandler {
           this.logger.debug('Cleaned up temp file', { path: file.tempPath });
         } catch (error) {
           this.logger.warn('Failed to cleanup temp file', { path: file.tempPath, error });
+        }
+      }
+      // Also clean up preprocessed file if it's different from the original
+      if (file.preprocessedPath && file.preprocessedPath !== file.tempPath) {
+        try {
+          fs.unlinkSync(file.preprocessedPath);
+          this.logger.debug('Cleaned up preprocessed file', { path: file.preprocessedPath });
+        } catch (error) {
+          this.logger.warn('Failed to cleanup preprocessed file', { path: file.preprocessedPath, error });
         }
       }
     }

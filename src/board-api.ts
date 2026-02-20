@@ -354,8 +354,8 @@ export class BoardApiServer {
 
       const item = store.addItem(partial);
 
-      // Push SSE update to connected clients after our own mutation
-      this.pushSSEUpdate(req.params.id, store.load());
+      // SSE update is now handled by store.onChanged() callback
+      // triggered by notifyChanged() in addItem()
 
       res.status(201).json(item);
     } catch (error) {
@@ -427,8 +427,8 @@ export class BoardApiServer {
         return;
       }
 
-      // Push SSE update after our own mutation
-      this.pushSSEUpdate(req.params.id, store.load());
+      // SSE update is now handled by store.onChanged() callback
+      // triggered by notifyChanged() in updateItem()
 
       // Fire status transition callback if status changed
       if (safeUpdates.status && oldStatus !== safeUpdates.status) {
@@ -471,8 +471,8 @@ export class BoardApiServer {
         return;
       }
 
-      // Push SSE update after deletion
-      this.pushSSEUpdate(req.params.id, store.load());
+      // SSE update is now handled by store.onChanged() callback
+      // triggered by notifyChanged() in deleteItem()
 
       res.status(204).send();
     } catch (error) {

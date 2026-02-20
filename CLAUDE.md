@@ -87,6 +87,12 @@ BASE_DIRECTORY=/Users/username/Code/
 CLAUDE_CODE_USE_BEDROCK=1
 CLAUDE_CODE_USE_VERTEX=1
 
+# Trello Two-Way Sync (opt-in)
+TRELLO_ENABLED=true
+TRELLO_API_KEY=your-trello-api-key
+TRELLO_TOKEN=your-trello-token
+TRELLO_POLL_INTERVAL_MS=30000   # default 30s
+
 # Development
 DEBUG=true
 ```
@@ -168,6 +174,35 @@ User: @ClaudeBot list all TODO comments in the project
 Bot: [Uses mcp__filesystem tools to search files]
 ```
 
+## Deployment (macOS Service)
+
+The bot runs as a macOS launchd service that auto-starts on login and auto-restarts on crash.
+
+- **Service label**: `com.jpathak.claude-code-slack`
+- **Plist file**: `~/Library/LaunchAgents/com.jpathak.claude-code-slack.plist`
+- **Runs**: `npm run dev` (tsx watch) from the project directory
+- **Logs**: `~/Library/Logs/claude-code-slack.log` (stdout), `~/Library/Logs/claude-code-slack.error.log` (stderr)
+- **KeepAlive**: `true` (auto-restarts on crash)
+
+### Service Management Commands
+```bash
+# Restart the bot
+launchctl kickstart -k gui/$(id -u)/com.jpathak.claude-code-slack
+
+# Stop the bot
+launchctl bootout gui/$(id -u)/com.jpathak.claude-code-slack
+
+# Start the bot (after bootout)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jpathak.claude-code-slack.plist
+
+# Check status
+launchctl list com.jpathak.claude-code-slack
+
+# Tail logs
+tail -f ~/Library/Logs/claude-code-slack.log
+tail -f ~/Library/Logs/claude-code-slack.error.log
+```
+
 ## Development
 
 ### Build and Run
@@ -189,6 +224,7 @@ src/
 ├── file-handler.ts               # File processing
 ├── todo-manager.ts               # Task tracking
 ├── mcp-manager.ts                # MCP server management
+├── trello-sync.ts                # Two-way Trello board sync
 ├── logger.ts                     # Logging utility
 └── types.ts                      # Type definitions
 

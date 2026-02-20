@@ -54,6 +54,8 @@ export interface KanbanItem {
   assignee?: string;
   source: 'claude' | 'user';
   questions?: string[];
+  /** Slack thread timestamp where clarification is being requested */
+  clarificationThreadTs?: string;
   createdAt: string;
   updatedAt: string;
 }
