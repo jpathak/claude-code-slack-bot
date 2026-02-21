@@ -1191,6 +1191,11 @@ export class SlackHandler {
           // Automatically trigger planning: move to planning, send to Claude for AC generation
           this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
             this.logger.error('Auto-planning failed', { itemId: item.id, error: err });
+            // Recovery: move back to backlog if still stuck in planning
+            const currentItem = this.kanbanManager?.getStore(channel).findItem(item.id);
+            if (currentItem && currentItem.status === 'planning') {
+              this.kanbanManager?.getStore(channel).moveItem(item.id, 'backlog');
+            }
           });
           break;
         }
@@ -1226,6 +1231,10 @@ export class SlackHandler {
             if (cmd.status === 'planning') {
               this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
                 this.logger.error('Auto-planning failed after move', { itemId: item.id, error: err });
+                const currentItem = this.kanbanManager?.getStore(channel).findItem(item.id);
+                if (currentItem && currentItem.status === 'planning') {
+                  this.kanbanManager?.getStore(channel).moveItem(item.id, 'backlog');
+                }
               });
             } else if (cmd.status === 'ready') {
               // Task moved to "ready" - prompt user to approve with "go" command
@@ -1238,6 +1247,10 @@ export class SlackHandler {
               const isRetry = oldMoveStatus === 'review';
               this.triggerTaskImplementation(channel, item.id, threadTs, say, isRetry).catch(err => {
                 this.logger.error('Auto-implementation failed after move', { itemId: item.id, error: err });
+                const currentItem = this.kanbanManager?.getStore(channel).findItem(item.id);
+                if (currentItem && currentItem.status === 'in_progress') {
+                  this.kanbanManager?.getStore(channel).moveItem(item.id, 'ready');
+                }
               });
             }
           } else {
@@ -1265,6 +1278,10 @@ export class SlackHandler {
             // Send the task to Claude for implementation
             this.triggerTaskImplementation(channel, goItem.id, threadTs, say, isRetry).catch(err => {
               this.logger.error('Task implementation trigger failed', { itemId: goItem.id, error: err });
+              const currentItem = store.findItem(goItem.id);
+              if (currentItem && currentItem.status === 'in_progress') {
+                store.moveItem(goItem.id, 'ready');
+              }
             });
           } else {
             await say({
@@ -1295,6 +1312,10 @@ export class SlackHandler {
               // Re-trigger planning with auto-implementation if no more questions
               this.triggerTaskPlanningWithAutoImplement(channel, updated.id, threadTs, say).catch(err => {
                 this.logger.error('Re-planning failed after answer', { itemId: updated.id, error: err });
+                const currentItem = this.kanbanManager?.getStore(channel).findItem(updated.id);
+                if (currentItem && currentItem.status === 'planning') {
+                  this.kanbanManager?.getStore(channel).moveItem(updated.id, 'backlog');
+                }
               });
             }
           } else {
@@ -1476,9 +1497,20 @@ export class SlackHandler {
 
     let planningOutput = '';
     const abortController = new AbortController();
+    const controllerKey = `SYSTEM_PLANNER-${channel}-${threadTs}`;
+    this.activeControllers.set(controllerKey, abortController);
+
     const tracker: ToolActivityTracker = { reads: 0, edits: 0, writes: 0, bashes: 0, others: 0, toolNames: new Set() };
     let statusMessageTs: string | undefined;
     let lastStatusUpdateMs = 0;
+    let timedOut = false;
+
+    // Timeout watchdog
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      this.logger.warn('Planning timed out', { itemId, timeoutMs: config.kanban.planningTimeoutMs });
+      abortController.abort();
+    }, config.kanban.planningTimeoutMs);
 
     // Post initial status message that we'll update with progress
     const statusResult = await say({
@@ -1550,16 +1582,32 @@ export class SlackHandler {
           }
         }
       }
+
+      // Check if aborted (e.g. timeout) after the loop completes without throwing
+      if (abortController.signal.aborted) {
+        throw new Error(timedOut ? 'Planning timed out' : 'Planning aborted');
+      }
     } catch (err) {
       this.logger.error('Planning query failed', { itemId, error: err });
+
+      // Move task back to backlog so it can be re-planned
+      const currentItem = store.findItem(itemId);
+      if (currentItem && currentItem.status === 'planning') {
+        store.moveItem(itemId, 'backlog');
+      }
+
+      const errMsg = timedOut
+        ? `Auto-planning for task *#${itemId}* timed out after ${Math.round(config.kanban.planningTimeoutMs / 60000)} minutes. Task moved back to *Backlog*.`
+        : `Auto-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}. Task moved back to *Backlog*.`;
+
       if (statusMessageTs) {
         await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '❌ *Planning failed*' });
       }
-      await say({
-        text: `⚠️ Auto-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}`,
-        thread_ts: threadTs,
-      });
+      await say({ text: `⚠️ ${errMsg}`, thread_ts: threadTs });
       return;
+    } finally {
+      clearTimeout(timeoutHandle);
+      this.activeControllers.delete(controllerKey);
     }
 
     // Update status to done
@@ -1637,10 +1685,21 @@ export class SlackHandler {
     const session = this.claudeHandler.createSession(implUser, channel, threadTs);
 
     const abortController = new AbortController();
+    const controllerKey = `SYSTEM_IMPL-${channel}-${threadTs}`;
+    this.activeControllers.set(controllerKey, abortController);
+
     let lastTextOutput = '';
     const tracker: ToolActivityTracker = { reads: 0, edits: 0, writes: 0, bashes: 0, others: 0, toolNames: new Set() };
     let statusMessageTs: string | undefined;
     let lastStatusUpdateMs = 0;
+    let timedOut = false;
+
+    // Timeout watchdog
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      this.logger.warn('Implementation timed out', { itemId, timeoutMs: config.kanban.implementationTimeoutMs });
+      abortController.abort();
+    }, config.kanban.implementationTimeoutMs);
 
     // Post status message that we'll update with progress
     const statusResult = await say({
@@ -1720,16 +1779,32 @@ export class SlackHandler {
           }
         }
       }
+
+      // Check if aborted (e.g. timeout) after the loop completes without throwing
+      if (abortController.signal.aborted) {
+        throw new Error(timedOut ? 'Implementation timed out' : 'Implementation aborted');
+      }
     } catch (err) {
       this.logger.error('Implementation query failed', { itemId, error: err });
+
+      // Move task back to ready so it can be retried
+      const currentItem = store.findItem(itemId);
+      if (currentItem && currentItem.status === 'in_progress') {
+        store.moveItem(itemId, 'ready');
+      }
+
+      const errMsg = timedOut
+        ? `Implementation of task *#${item.id}* timed out after ${Math.round(config.kanban.implementationTimeoutMs / 60000)} minutes. Task moved back to *Ready*.`
+        : `Implementation of task *#${item.id}* encountered an error: ${(err as Error).message || 'Unknown error'}. Task moved back to *Ready*.`;
+
       if (statusMessageTs) {
         await this.app.client.chat.update({ channel, ts: statusMessageTs, text: `❌ *Implementation of task #${item.id} failed*` });
       }
-      await say({
-        text: `⚠️ Implementation of task *#${item.id}* encountered an error: ${(err as Error).message || 'Unknown error'}`,
-        thread_ts: threadTs,
-      });
+      await say({ text: `⚠️ ${errMsg}`, thread_ts: threadTs });
       return;
+    } finally {
+      clearTimeout(timeoutHandle);
+      this.activeControllers.delete(controllerKey);
     }
 
     // Save implementation notes to spec dir
@@ -1826,6 +1901,10 @@ export class SlackHandler {
       // After re-planning completes, if no more questions, auto-start implementation
       this.triggerTaskPlanningWithAutoImplement(channel, updated.id, threadTs, say).catch(err => {
         this.logger.error('Re-planning failed after thread reply', { itemId: updated.id, error: err });
+        const currentItem = store.findItem(updated.id);
+        if (currentItem && currentItem.status === 'planning') {
+          store.moveItem(updated.id, 'backlog');
+        }
       });
     }
   }
@@ -1859,9 +1938,20 @@ export class SlackHandler {
 
     let planningOutput = '';
     const abortController = new AbortController();
+    const controllerKey = `SYSTEM_PLANNER-${channel}-${threadTs}`;
+    this.activeControllers.set(controllerKey, abortController);
+
     const tracker: ToolActivityTracker = { reads: 0, edits: 0, writes: 0, bashes: 0, others: 0, toolNames: new Set() };
     let statusMessageTs: string | undefined;
     let lastStatusUpdateMs = 0;
+    let timedOut = false;
+
+    // Timeout watchdog
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      this.logger.warn('Re-planning timed out', { itemId, timeoutMs: config.kanban.planningTimeoutMs });
+      abortController.abort();
+    }, config.kanban.planningTimeoutMs);
 
     // Post initial status message that we'll update with progress
     const statusResult = await say({
@@ -1933,16 +2023,32 @@ export class SlackHandler {
           }
         }
       }
+
+      // Check if aborted (e.g. timeout) after the loop completes without throwing
+      if (abortController.signal.aborted) {
+        throw new Error(timedOut ? 'Re-planning timed out' : 'Re-planning aborted');
+      }
     } catch (err) {
       this.logger.error('Re-planning query failed', { itemId, error: err });
+
+      // Move task back to backlog so it can be re-planned
+      const currentItem = store.findItem(itemId);
+      if (currentItem && currentItem.status === 'planning') {
+        store.moveItem(itemId, 'backlog');
+      }
+
+      const errMsg = timedOut
+        ? `Re-planning for task *#${itemId}* timed out after ${Math.round(config.kanban.planningTimeoutMs / 60000)} minutes. Task moved back to *Backlog*.`
+        : `Re-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}. Task moved back to *Backlog*.`;
+
       if (statusMessageTs) {
         await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '❌ *Re-planning failed*' });
       }
-      await say({
-        text: `⚠️ Re-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}`,
-        thread_ts: threadTs,
-      });
+      await say({ text: `⚠️ ${errMsg}`, thread_ts: threadTs });
       return;
+    } finally {
+      clearTimeout(timeoutHandle);
+      this.activeControllers.delete(controllerKey);
     }
 
     // Update status to done
@@ -1983,6 +2089,10 @@ export class SlackHandler {
       store.moveItem(updated.id, 'in_progress');
       this.triggerTaskImplementation(channel, updated.id, threadTs, say, false).catch(err => {
         this.logger.error('Auto-implementation failed after clarification', { itemId: updated.id, error: err });
+        const currentItem = store.findItem(updated.id);
+        if (currentItem && currentItem.status === 'in_progress') {
+          store.moveItem(updated.id, 'ready');
+        }
       });
     }
   }
@@ -2368,6 +2478,48 @@ export class SlackHandler {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
+    }
+
+    // Recover stuck tasks before aborting active controllers
+    if (this.kanbanManager) {
+      for (const [sessionKey] of this.activeControllers) {
+        try {
+          // Parse session key to determine task type and channel
+          // Keys are: SYSTEM_IMPL-{channel}-{threadTs} or SYSTEM_PLANNER-{channel}-{threadTs}
+          const parts = sessionKey.split('-');
+          if (parts.length < 3) continue;
+          const prefix = parts[0]; // SYSTEM_IMPL or SYSTEM_PLANNER
+          // Channel IDs can contain hyphens, so rejoin all middle parts
+          // The threadTs is the last part (e.g. "1234567890.123456")
+          const threadTs = parts[parts.length - 1];
+          const channel = parts.slice(1, parts.length - 1).join('-');
+
+          if (!channel) continue;
+
+          const store = this.kanbanManager.getStore(channel);
+          const items = store.getItems();
+
+          if (prefix === 'SYSTEM_IMPL') {
+            // Move in_progress tasks back to ready
+            for (const item of items) {
+              if (item.status === 'in_progress') {
+                store.moveItem(item.id, 'ready');
+                this.logger.info('Shutdown recovery: moved in_progress task to ready', { itemId: item.id, channel });
+              }
+            }
+          } else if (prefix === 'SYSTEM_PLANNER') {
+            // Move planning tasks back to backlog
+            for (const item of items) {
+              if (item.status === 'planning') {
+                store.moveItem(item.id, 'backlog');
+                this.logger.info('Shutdown recovery: moved planning task to backlog', { itemId: item.id, channel });
+              }
+            }
+          }
+        } catch (err) {
+          this.logger.error('Error during shutdown task recovery', { sessionKey, error: err });
+        }
+      }
     }
 
     // Abort any active requests

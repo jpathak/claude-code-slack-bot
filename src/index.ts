@@ -11,6 +11,7 @@ import { KanbanManager } from './kanban-manager.js';
 import { ChannelProvisioner } from './channel-provisioner.js';
 import { WorkingDirectoryManager } from './working-directory-manager.js';
 import { BoardApiServer } from './board-api.js';
+import { BoardStore } from './board-store.js';
 import { TrelloSync } from './trello-sync.js';
 
 const logger = new Logger('Main');
@@ -73,6 +74,70 @@ async function handleSelfDebugging(
   }
 }
 
+/**
+ * Scan all projects for tasks stuck in transient states (in_progress, planning)
+ * and move them to recovery states. This handles orphaned tasks from bot crashes.
+ */
+async function recoverStuckTasks(
+  app: InstanceType<typeof App>,
+  projectConfig: ProjectConfig,
+  logger: Logger,
+): Promise<void> {
+  const projects = projectConfig.getAll();
+  let recoveredCount = 0;
+
+  for (const project of projects) {
+    try {
+      const store = new BoardStore(project.projectPath);
+      const items = store.getItems();
+      const recovered: string[] = [];
+
+      for (const item of items) {
+        if (item.status === 'in_progress') {
+          store.moveItem(item.id, 'ready');
+          recovered.push(`#${item.id} (in_progress -> ready)`);
+          recoveredCount++;
+        } else if (item.status === 'planning') {
+          store.moveItem(item.id, 'backlog');
+          recovered.push(`#${item.id} (planning -> backlog)`);
+          recoveredCount++;
+        }
+      }
+
+      if (recovered.length > 0) {
+        logger.info('Startup recovery: moved stuck tasks', {
+          project: project.projectName,
+          recovered,
+        });
+
+        // Notify the project's Slack channel
+        try {
+          await app.client.chat.postMessage({
+            channel: project.channelId,
+            text: `🔄 *Startup recovery:* ${recovered.length} stuck task(s) recovered after restart:\n${recovered.map(r => `  - ${r}`).join('\n')}`,
+          });
+        } catch (slackErr) {
+          logger.warn('Failed to send recovery notification to Slack', {
+            channel: project.channelId,
+            error: slackErr,
+          });
+        }
+      }
+    } catch (err) {
+      logger.error('Error during startup recovery for project', {
+        project: project.projectName,
+        error: err,
+      });
+    }
+  }
+
+  if (recoveredCount > 0) {
+    logger.info('Startup recovery complete', { totalRecovered: recoveredCount });
+  } else {
+    logger.info('Startup recovery complete: no stuck tasks found');
+  }
+}
+
 async function start() {
   try {
     // Validate configuration
@@ -113,12 +178,13 @@ async function start() {
     // Initialize kanban/project components if enabled
     let channelProvisioner: ChannelProvisioner | null = null;
     let projectConfig: ProjectConfig | null = null;
+    let kanbanManager: KanbanManager | null = null;
     let boardApiServer: BoardApiServer | null = null;
     let trelloSync: TrelloSync | null = null;
 
     if (config.kanban.enabled) {
       projectConfig = new ProjectConfig();
-      const kanbanManager = new KanbanManager(app, projectConfig);
+      kanbanManager = new KanbanManager(app, projectConfig);
 
       // We need a reference to the WorkingDirectoryManager inside SlackHandler.
       // Since SlackHandler creates its own, we create a shared one and pass it
@@ -193,6 +259,14 @@ async function start() {
           logger.error('Channel provisioning sync failed', err);
         });
       }, 3000);
+    }
+
+    // Recover tasks stuck in transient states from a previous crash/restart
+    if (projectConfig && kanbanManager) {
+      const recoveryProjectConfig = projectConfig;
+      setTimeout(() => {
+        recoverStuckTasks(app, recoveryProjectConfig, logger);
+      }, 4000);
     }
 
     // Initialize Trello sync if enabled and kanban is active
