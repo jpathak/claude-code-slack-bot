@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TaskPlanner } from './task-planner.js';
 import { BoardStore } from './board-store.js';
-import { KanbanItem, BoardData } from './types.js';
+import { TaskItem, BoardData } from './types.js';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -35,7 +35,7 @@ describe('TaskPlanner', () => {
 
   describe('generatePlanningPrompt', () => {
     it('should include the task ID and title', () => {
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '1',
         title: 'Implement OAuth2 login',
         status: 'backlog',
@@ -51,7 +51,7 @@ describe('TaskPlanner', () => {
     });
 
     it('should include the description when present', () => {
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '2',
         title: 'Add caching layer',
         description: 'We need Redis-based caching for the API responses',
@@ -67,7 +67,7 @@ describe('TaskPlanner', () => {
     });
 
     it('should not include a description line when there is none', () => {
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '3',
         title: 'Fix bug',
         status: 'backlog',
@@ -82,7 +82,7 @@ describe('TaskPlanner', () => {
     });
 
     it('should instruct Claude to generate acceptance criteria', () => {
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '1',
         title: 'Test task',
         status: 'backlog',
@@ -648,7 +648,7 @@ describe('TaskPlanner', () => {
   describe('savePlanSpec', () => {
     it('should save a plan.md with task title and planning output', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '5',
         title: 'Implement auth',
         description: 'OAuth2 with Google',
@@ -672,7 +672,7 @@ describe('TaskPlanner', () => {
   describe('saveImplementationSpec', () => {
     it('should save an implementation.md with output', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '8',
         title: 'Add caching',
         status: 'in_progress',
@@ -697,7 +697,7 @@ describe('TaskPlanner', () => {
   describe('generateImplementationPrompt', () => {
     it('should include task title and description', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '3',
         title: 'Build user profile page',
         description: 'Show name, email, and avatar',
@@ -716,7 +716,7 @@ describe('TaskPlanner', () => {
 
     it('should include acceptance criteria when present', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '4',
         title: 'Task with AC',
         acceptanceCriteria: ['Users can log in', 'Session persists'],
@@ -734,7 +734,7 @@ describe('TaskPlanner', () => {
 
     it('should include spec context from plan.md if it exists', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '6',
         title: 'Task with existing plan',
         status: 'in_progress',
@@ -754,7 +754,7 @@ describe('TaskPlanner', () => {
 
     it('should work without existing plan spec', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '99',
         title: 'No plan task',
         status: 'in_progress',
@@ -776,7 +776,7 @@ describe('TaskPlanner', () => {
   describe('generatePlanningPrompt with projectPath', () => {
     it('should include spec save path note', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '11',
         title: 'Plan with path',
         status: 'planning',
@@ -792,7 +792,7 @@ describe('TaskPlanner', () => {
 
     it('should include existing spec context if plan.md already exists', () => {
       const now = new Date().toISOString();
-      const item: KanbanItem = {
+      const item: TaskItem = {
         id: '12',
         title: 'Re-plan task',
         status: 'planning',

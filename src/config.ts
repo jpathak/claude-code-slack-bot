@@ -20,18 +20,12 @@ export interface Config {
   debug: boolean;
   selfDebugOnCrash: boolean;
   defaultVerbosity: 'minimal' | 'normal' | 'verbose';
-  kanban: {
+  tasks: {
     enabled: boolean;
     autoProvision: boolean;
     channelPrefix: string;
     implementationTimeoutMs: number;
     planningTimeoutMs: number;
-  };
-  boardApi: {
-    port: number;
-    enabled: boolean;
-    apiKey: string;
-    allowedOrigins: string[];
   };
   trello: {
     enabled: boolean;
@@ -78,20 +72,12 @@ function createConfig(): Config {
     defaultVerbosity: (['minimal', 'normal', 'verbose'].includes(process.env.DEFAULT_VERBOSITY || '')
       ? process.env.DEFAULT_VERBOSITY as 'minimal' | 'normal' | 'verbose'
       : 'normal'),
-    kanban: {
-      enabled: process.env.KANBAN_ENABLED !== 'false',
+    tasks: {
+      enabled: process.env.TASKS_ENABLED !== 'false',
       autoProvision: process.env.AUTO_PROVISION_CHANNELS !== 'false',
       channelPrefix: process.env.CHANNEL_PREFIX || 'proj-',
       implementationTimeoutMs: parseInt(process.env.TASK_IMPLEMENTATION_TIMEOUT_MS || '1800000', 10), // 30 minutes
       planningTimeoutMs: parseInt(process.env.TASK_PLANNING_TIMEOUT_MS || '600000', 10), // 10 minutes
-    },
-    boardApi: {
-      port: parseInt(process.env.BOARD_API_PORT || '7000', 10),
-      enabled: process.env.BOARD_API_ENABLED !== 'false',
-      apiKey: process.env.BOARD_API_KEY || '',
-      allowedOrigins: process.env.BOARD_API_ALLOWED_ORIGINS
-        ? process.env.BOARD_API_ALLOWED_ORIGINS.split(',').map(o => o.trim())
-        : ['http://localhost:5173', 'http://localhost:7000'],
     },
     trello: {
       enabled: process.env.TRELLO_ENABLED === 'true',

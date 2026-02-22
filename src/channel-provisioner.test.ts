@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { ChannelProvisioner } from './channel-provisioner.js';
 import { ProjectConfig } from './project-config.js';
 import { WorkingDirectoryManager } from './working-directory-manager.js';
-import { KanbanManager } from './kanban-manager.js';
+import { TaskManager } from './task-manager.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -11,7 +11,7 @@ import * as os from 'os';
 vi.mock('./config.js', () => ({
   config: {
     baseDirectory: '',
-    kanban: {
+    tasks: {
       enabled: true,
       autoProvision: true,
       channelPrefix: 'proj-',
@@ -41,7 +41,7 @@ describe('ChannelProvisioner', () => {
   let app: any;
   let projectConfig: ProjectConfig;
   let workingDirManager: WorkingDirectoryManager;
-  let kanbanManager: KanbanManager;
+  let taskManager: TaskManager;
   let provisioner: ChannelProvisioner;
   let tmpDir: string;
   let configPath: string;
@@ -51,8 +51,8 @@ describe('ChannelProvisioner', () => {
     configPath = path.join(os.tmpdir(), `project-config-prov-test-${Date.now()}.json`);
     projectConfig = new ProjectConfig(configPath);
     workingDirManager = new WorkingDirectoryManager();
-    kanbanManager = new KanbanManager(app, projectConfig);
-    provisioner = new ChannelProvisioner(app, projectConfig, workingDirManager, kanbanManager);
+    taskManager = new TaskManager(app, projectConfig);
+    provisioner = new ChannelProvisioner(app, projectConfig, workingDirManager, taskManager);
 
     // Create a temp workspace directory
     tmpDir = path.join(os.tmpdir(), `workspace-test-${Date.now()}`);
@@ -130,11 +130,11 @@ describe('ChannelProvisioner', () => {
 
     it('should skip when auto-provision disabled', async () => {
       (config as any).baseDirectory = tmpDir;
-      (config as any).kanban.autoProvision = false;
+      (config as any).tasks.autoProvision = false;
       const result = await provisioner.syncAll();
       expect(result.scanned).toBe(0);
       // Reset
-      (config as any).kanban.autoProvision = true;
+      (config as any).tasks.autoProvision = true;
     });
 
     it('should create channels for new projects', async () => {

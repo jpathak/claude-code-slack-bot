@@ -7,7 +7,7 @@ import { Logger } from './logger.js';
 import { config } from './config.js';
 import { ProjectConfig } from './project-config.js';
 import { WorkingDirectoryManager } from './working-directory-manager.js';
-import { KanbanManager } from './kanban-manager.js';
+import { TaskManager } from './task-manager.js';
 import { ProjectMapping } from './types.js';
 
 interface ProjectInfo {
@@ -30,19 +30,19 @@ export class ChannelProvisioner {
   private app: AppType;
   private projectConfig: ProjectConfig;
   private workingDirManager: WorkingDirectoryManager;
-  private kanbanManager: KanbanManager;
+  private taskManager: TaskManager;
   private logger = new Logger('ChannelProvisioner');
 
   constructor(
     app: AppType,
     projectConfig: ProjectConfig,
     workingDirManager: WorkingDirectoryManager,
-    kanbanManager: KanbanManager,
+    taskManager: TaskManager,
   ) {
     this.app = app;
     this.projectConfig = projectConfig;
     this.workingDirManager = workingDirManager;
-    this.kanbanManager = kanbanManager;
+    this.taskManager = taskManager;
   }
 
   /**
@@ -56,7 +56,7 @@ export class ChannelProvisioner {
       return result;
     }
 
-    if (!config.kanban.autoProvision) {
+    if (!config.tasks.autoProvision) {
       this.logger.info('Auto-provision disabled, skipping channel sync');
       return result;
     }
@@ -197,12 +197,12 @@ export class ChannelProvisioner {
     // Set the working directory for this channel
     this.workingDirManager.setWorkingDirectory(channelId, project.path);
 
-    // Try to create a kanban list
+    // Try to create a task list
     let listId: string | null = null;
     try {
-      listId = await this.kanbanManager.ensureList(channelId, project.name);
+      listId = await this.taskManager.ensureList(channelId, project.name);
     } catch (error) {
-      this.logger.warn('Failed to create kanban list for adopted channel', { channelName, error });
+      this.logger.warn('Failed to create task list for adopted channel', { channelName, error });
     }
 
     // Save mapping
@@ -252,12 +252,12 @@ export class ChannelProvisioner {
     // Set working directory
     this.workingDirManager.setWorkingDirectory(channelId, project.path);
 
-    // Try to create a kanban list
+    // Try to create a task list
     let listId: string | null = null;
     try {
-      listId = await this.kanbanManager.ensureList(channelId, project.name);
+      listId = await this.taskManager.ensureList(channelId, project.name);
     } catch (error) {
-      this.logger.warn('Failed to create kanban list for new channel', { channelName, error });
+      this.logger.warn('Failed to create task list for new channel', { channelName, error });
     }
 
     // Save mapping
@@ -276,7 +276,7 @@ export class ChannelProvisioner {
     try {
       await this.app.client.chat.postMessage({
         channel: channelId,
-        text: `Welcome to *#${channelName}*! This channel is auto-mapped to \`${project.path}\`.\n\nWorking directory is already set. Just start chatting!\n\nCommands: \`board\` (kanban), \`add task <desc>\`, \`done <ref>\`, \`sync\``,
+        text: `Welcome to *#${channelName}*! This channel is auto-mapped to \`${project.path}\`.\n\nWorking directory is already set. Just start chatting!\n\nTasks are synced to Trello automatically.`,
       });
     } catch (error) {
       this.logger.warn('Failed to post welcome message', { channelName, error });
@@ -291,7 +291,7 @@ export class ChannelProvisioner {
    * prefix with configured prefix, truncate to 80 chars.
    */
   normalizeChannelName(dirName: string): string {
-    const prefix = config.kanban.channelPrefix;
+    const prefix = config.tasks.channelPrefix;
     let normalized = dirName
       .toLowerCase()
       .replace(/[^a-z0-9-]/g, '-')

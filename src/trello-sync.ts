@@ -6,7 +6,7 @@ import { Logger } from './logger.js';
 import { Config } from './config.js';
 import { ProjectConfig } from './project-config.js';
 import { BoardStore } from './board-store.js';
-import { KanbanItem, KanbanStatus, KANBAN_STATUSES, DEFAULT_BOARD_COLUMNS } from './types.js';
+import { TaskItem, TaskStatus, TASK_STATUSES, DEFAULT_BOARD_COLUMNS } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -18,13 +18,15 @@ interface TrelloCardMapping {
   lastSyncedAt: string;
   lastLocalHash: string;
   lastTrelloHash: string;
+  /** ID of the bot's clarification comment, used to detect user replies */
+  clarificationCommentId?: string;
 }
 
 interface TrelloMapping {
   version: 1;
   boardId: string;
   boardUrl: string;
-  listIds: Record<KanbanStatus, string>;
+  listIds: Record<TaskStatus, string>;
   cards: TrelloCardMapping[];
 }
 
@@ -34,6 +36,20 @@ interface TrelloCard {
   desc: string;
   idList: string;
   closed: boolean;
+}
+
+interface TrelloComment {
+  id: string;
+  data: {
+    text: string;
+    card: { id: string; name: string };
+  };
+  date: string;
+  memberCreator: {
+    id: string;
+    username: string;
+    fullName: string;
+  };
 }
 
 interface TrelloList {
@@ -56,8 +72,18 @@ interface TrelloBoard {
 export type TrelloStatusTransitionCallback = (
   projectId: string,
   itemId: string,
-  oldStatus: KanbanStatus | undefined,
-  newStatus: KanbanStatus,
+  oldStatus: TaskStatus | undefined,
+  newStatus: TaskStatus,
+  projectPath: string,
+) => void;
+
+/**
+ * Callback fired when a user replies to a clarification comment on a Trello card.
+ */
+export type TrelloClarificationReplyCallback = (
+  projectId: string,
+  itemId: string,
+  replyText: string,
   projectPath: string,
 ) => void;
 
@@ -70,7 +96,7 @@ const OUTBOUND_DEBOUNCE_MS = 2000;
 const ECHO_WINDOW_MS = 10000;
 
 // Map our status IDs to user-friendly Trello list names matching DEFAULT_BOARD_COLUMNS
-const STATUS_TO_LIST_NAME: Record<KanbanStatus, string> = {
+const STATUS_TO_LIST_NAME: Record<TaskStatus, string> = {
   backlog: 'Backlog',
   clarification_needed: 'Clarification Needed',
   planning: 'Planning',
@@ -80,10 +106,10 @@ const STATUS_TO_LIST_NAME: Record<KanbanStatus, string> = {
   done: 'Done',
 };
 
-// Reverse lookup: Trello list name -> kanban status
-const LIST_NAME_TO_STATUS: Record<string, KanbanStatus> = {};
+// Reverse lookup: Trello list name -> task status
+const LIST_NAME_TO_STATUS: Record<string, TaskStatus> = {};
 for (const [status, name] of Object.entries(STATUS_TO_LIST_NAME)) {
-  LIST_NAME_TO_STATUS[name] = status as KanbanStatus;
+  LIST_NAME_TO_STATUS[name] = status as TaskStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +121,7 @@ export class TrelloSync {
   private config: Config;
   private projectConfig: ProjectConfig;
   private statusTransitionCallback: TrelloStatusTransitionCallback | null = null;
+  private clarificationReplyCallback: TrelloClarificationReplyCallback | null = null;
 
   // Polling state
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -131,6 +158,13 @@ export class TrelloSync {
   }
 
   /**
+   * Set callback for user replies to clarification comments on Trello cards.
+   */
+  onClarificationReply(callback: TrelloClarificationReplyCallback): void {
+    this.clarificationReplyCallback = callback;
+  }
+
+  /**
    * Initialize Trello sync for a single project.
    * Creates/finds the Trello board, ensures 7 lists, does initial reconciliation.
    */
@@ -139,7 +173,7 @@ export class TrelloSync {
       this.logger.info('Initializing Trello sync for project', { projectName, projectPath });
 
       // Find or create a Trello board
-      const board = await this.findOrCreateBoard(`${projectName} Kanban`);
+      const board = await this.findOrCreateBoard(projectName);
       if (!board) {
         this.logger.error('Failed to create or find Trello board', { projectName });
         return;
@@ -223,6 +257,112 @@ export class TrelloSync {
   }
 
   // ---------------------------------------------------------------------------
+  // Clarification Comments
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Post a clarification comment on a Trello card and track the comment ID.
+   * Called when a task moves to clarification_needed with questions.
+   */
+  async postClarificationComment(projectPath: string, itemId: string, questions: string[]): Promise<void> {
+    const mapping = this.loadMapping(projectPath);
+    if (!mapping) return;
+
+    const cardMapping = mapping.cards.find(c => c.localId === itemId);
+    if (!cardMapping) {
+      this.logger.warn('Cannot post clarification comment: no card mapping', { itemId });
+      return;
+    }
+
+    const commentText = `🤖 **Clarification Needed**\n\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\n_Reply to this comment with your answers._`;
+
+    const result = await this.trelloFetch<{ id: string }>('POST', `/cards/${cardMapping.trelloCardId}/actions/comments`, {
+      text: commentText,
+    });
+
+    if (result) {
+      cardMapping.clarificationCommentId = result.id;
+      this.saveMapping(projectPath, mapping);
+      this.logger.info('Posted clarification comment on Trello card', {
+        itemId,
+        cardId: cardMapping.trelloCardId,
+        commentId: result.id,
+      });
+    }
+  }
+
+  /**
+   * Check for user replies to clarification comments on cards in clarification_needed status.
+   * Called during inbound polling.
+   */
+  private async pollClarificationReplies(channelId: string, projectPath: string): Promise<void> {
+    if (!this.clarificationReplyCallback) return;
+
+    const mapping = this.loadMapping(projectPath);
+    if (!mapping) return;
+
+    const store = this.getOrCreateStore(channelId, projectPath);
+    const items = store.getItems();
+
+    // Find items waiting for clarification that have a tracked comment
+    const waitingItems = items.filter(
+      i => i.status === 'clarification_needed' &&
+        mapping.cards.find(c => c.localId === i.id && c.clarificationCommentId)
+    );
+
+    for (const item of waitingItems) {
+      const cardMapping = mapping.cards.find(c => c.localId === item.id)!;
+      if (!cardMapping.clarificationCommentId) continue;
+
+      // Fetch recent comments on the card
+      const comments = await this.trelloFetch<TrelloComment[]>(
+        'GET',
+        `/cards/${cardMapping.trelloCardId}/actions?filter=commentCard&limit=10`,
+      );
+
+      if (!comments || comments.length === 0) continue;
+
+      // Find comments that came AFTER the bot's clarification comment.
+      // Comments are returned newest-first. The bot's comment has a known ID.
+      // Any comment newer than the bot's comment that wasn't posted by the bot is a user reply.
+      const botCommentIdx = comments.findIndex(c => c.id === cardMapping.clarificationCommentId);
+
+      // All comments before the bot comment index (i.e., newer) are potential replies
+      const userReplies = botCommentIdx === -1
+        ? [] // Bot comment not found in recent comments (too old or deleted)
+        : comments.slice(0, botCommentIdx).filter(c => {
+          // Exclude comments that start with the bot's emoji marker
+          return !c.data.text.startsWith('🤖');
+        });
+
+      if (userReplies.length > 0) {
+        // Combine all user replies into a single answer
+        const answerText = userReplies
+          .reverse() // oldest first
+          .map(c => c.data.text)
+          .join('\n\n');
+
+        this.logger.info('Detected Trello clarification reply', {
+          itemId: item.id,
+          cardId: cardMapping.trelloCardId,
+          replyCount: userReplies.length,
+        });
+
+        // Clear the clarification comment tracking
+        cardMapping.clarificationCommentId = undefined;
+        this.saveMapping(projectPath, mapping);
+
+        // Fire the callback
+        try {
+          this.clarificationReplyCallback(channelId, item.id, answerText, projectPath);
+        } catch (err) {
+          this.logger.error('Error in clarification reply callback', { error: err });
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Trello API Client
   // ---------------------------------------------------------------------------
 
@@ -263,8 +403,8 @@ export class TrelloSync {
         return null;
       }
 
-      // DELETE returns no body
-      if (method === 'DELETE') return null;
+      // DELETE returns no body - return empty object to distinguish from error null
+      if (method === 'DELETE') return {} as T;
 
       return (await response.json()) as T;
     } catch (error) {
@@ -301,7 +441,7 @@ export class TrelloSync {
     return newBoard;
   }
 
-  private async ensureLists(boardId: string): Promise<Record<KanbanStatus, string> | null> {
+  private async ensureLists(boardId: string): Promise<Record<TaskStatus, string> | null> {
     // Get existing lists on the board
     const existingLists = await this.trelloFetch<TrelloList[]>('GET', `/boards/${boardId}/lists?filter=open`);
     if (!existingLists) return null;
@@ -311,11 +451,11 @@ export class TrelloSync {
       existingByName.set(list.name, list);
     }
 
-    const listIds: Partial<Record<KanbanStatus, string>> = {};
+    const listIds: Partial<Record<TaskStatus, string>> = {};
 
     // Create lists in order, matching our column order
-    for (let i = 0; i < KANBAN_STATUSES.length; i++) {
-      const status = KANBAN_STATUSES[i];
+    for (let i = 0; i < TASK_STATUSES.length; i++) {
+      const status = TASK_STATUSES[i];
       const listName = STATUS_TO_LIST_NAME[status];
       const existing = existingByName.get(listName);
 
@@ -338,7 +478,7 @@ export class TrelloSync {
       }
     }
 
-    return listIds as Record<KanbanStatus, string>;
+    return listIds as Record<TaskStatus, string>;
   }
 
   // ---------------------------------------------------------------------------
@@ -346,7 +486,7 @@ export class TrelloSync {
   // ---------------------------------------------------------------------------
 
   private getMappingPath(projectPath: string): string {
-    return path.join(projectPath, '.kanban', 'trello-mapping.json');
+    return path.join(projectPath, '.tasks', 'trello-mapping.json');
   }
 
   private loadMapping(projectPath: string): TrelloMapping | null {
@@ -382,7 +522,7 @@ export class TrelloSync {
     return crypto.createHash('md5').update(data).digest('hex');
   }
 
-  private hashCard(card: TrelloCard, listIdToStatus: Map<string, KanbanStatus>): string {
+  private hashCard(card: TrelloCard, listIdToStatus: Map<string, TaskStatus>): string {
     const status = listIdToStatus.get(card.idList) || 'backlog';
     // Strip the "Local ID: #N" footer from description before hashing
     const desc = this.stripLocalIdFooter(card.desc || '');
@@ -393,7 +533,7 @@ export class TrelloSync {
   // Card Description Formatting
   // ---------------------------------------------------------------------------
 
-  private formatCardDescription(item: KanbanItem): string {
+  private formatCardDescription(item: TaskItem): string {
     const parts: string[] = [];
 
     if (item.description) {
@@ -416,10 +556,11 @@ export class TrelloSync {
       }
     }
 
-    if (item.source || item.assignee) {
+    if (item.source || item.assignee || item.executingAgent) {
       parts.push('');
       if (item.source) parts.push(`Source: ${item.source}`);
       if (item.assignee) parts.push(`Assignee: ${item.assignee}`);
+      if (item.executingAgent) parts.push(`Executing: ${item.executingAgent}`);
     }
 
     // Always add a local ID footer for recovery
@@ -553,9 +694,16 @@ export class TrelloSync {
     const toRemove: string[] = [];
     for (const cardMapping of mapping.cards) {
       if (!localIds.has(cardMapping.localId)) {
-        await this.trelloFetch('DELETE', `/cards/${cardMapping.trelloCardId}`);
-        toRemove.push(cardMapping.localId);
-        mappingChanged = true;
+        const result = await this.trelloFetch('DELETE', `/cards/${cardMapping.trelloCardId}`);
+        if (result !== null) {
+          toRemove.push(cardMapping.localId);
+          mappingChanged = true;
+        } else {
+          this.logger.warn('Failed to delete Trello card, keeping mapping for retry', {
+            trelloCardId: cardMapping.trelloCardId,
+            localId: cardMapping.localId,
+          });
+        }
       }
     }
     if (toRemove.length > 0) {
@@ -584,6 +732,8 @@ export class TrelloSync {
       for (const project of projects) {
         try {
           await this.syncInbound(project.channelId, project.projectPath);
+          // Check for user replies to clarification comments on Trello cards
+          await this.pollClarificationReplies(project.channelId, project.projectPath);
         } catch (error) {
           this.logger.warn('Error syncing inbound for project', {
             projectName: project.projectName,
@@ -610,9 +760,9 @@ export class TrelloSync {
     const store = this.getOrCreateStore(channelId, projectPath);
 
     // Build reverse lookup: listId -> status
-    const listIdToStatus = new Map<string, KanbanStatus>();
+    const listIdToStatus = new Map<string, TaskStatus>();
     for (const [status, listId] of Object.entries(mapping.listIds)) {
-      listIdToStatus.set(listId, status as KanbanStatus);
+      listIdToStatus.set(listId, status as TaskStatus);
     }
 
     // Build set of Trello card IDs for deletion detection
@@ -789,6 +939,10 @@ export class TrelloSync {
 
   private recordOutboundSync(trelloCardId: string): void {
     this.recentOutboundSyncs.set(trelloCardId, Date.now());
+    // Prevent unbounded growth - clean stale entries periodically
+    if (this.recentOutboundSyncs.size > 100) {
+      this.cleanEchoWindow();
+    }
   }
 
   private isInEchoWindow(trelloCardId: string): boolean {

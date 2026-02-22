@@ -2,7 +2,7 @@ import fetch from 'node-fetch';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawn } from 'child_process';
+import sharp from 'sharp';
 import { Logger } from './logger.js';
 import { config } from './config.js';
 
@@ -25,8 +25,8 @@ export class FileHandler {
 
   /**
    * Preprocess an image to ensure compatibility with Claude's API.
-   * Uses macOS `sips` command to:
-   * - Convert HEIC/HEIF to PNG
+   * Uses sharp library (cross-platform) to:
+   * - Convert HEIC/HEIF/TIFF to PNG
    * - Resize large images
    * - Normalize color profiles
    */
@@ -41,52 +41,49 @@ export class FileHandler {
     const outputPath = imagePath.replace(/\.[^.]+$/, '.png');
 
     try {
-      // First, get image dimensions to check if resize is needed
-      const dimensions = await this.getImageDimensions(imagePath);
+      // Get image metadata to check dimensions
+      const metadata = await sharp(imagePath).metadata();
 
-      if (dimensions) {
+      if (metadata.width && metadata.height) {
         this.logger.debug('Image dimensions', {
           path: imagePath,
-          width: dimensions.width,
-          height: dimensions.height
+          width: metadata.width,
+          height: metadata.height
         });
       }
 
-      // Determine if we need to process the image
-      const needsResize = dimensions &&
-        (dimensions.width > MAX_IMAGE_DIMENSION || dimensions.height > MAX_IMAGE_DIMENSION);
+      // Determine if we need to resize the image
+      const needsResize = metadata.width && metadata.height &&
+        (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION);
 
       if (!needsConversion && !needsResize && mimetype === 'image/png') {
         // Image is already PNG and within size limits, no processing needed
         return imagePath;
       }
 
-      // Use sips to convert and/or resize the image
-      const args: string[] = [];
-
-      // Set format to PNG
-      args.push('-s', 'format', 'png');
+      // Build sharp pipeline
+      let pipeline = sharp(imagePath);
 
       // Resize if needed (maintain aspect ratio by setting max dimension)
-      if (needsResize) {
-        const maxDim = Math.max(dimensions!.width, dimensions!.height);
+      if (needsResize && metadata.width && metadata.height) {
+        const maxDim = Math.max(metadata.width, metadata.height);
         const scale = MAX_IMAGE_DIMENSION / maxDim;
-        const newWidth = Math.floor(dimensions!.width * scale);
-        const newHeight = Math.floor(dimensions!.height * scale);
-        args.push('-z', String(newHeight), String(newWidth));
+        const newWidth = Math.floor(metadata.width * scale);
+        const newHeight = Math.floor(metadata.height * scale);
+
+        pipeline = pipeline.resize(newWidth, newHeight, {
+          fit: 'inside',
+          withoutEnlargement: true,
+        });
+
         this.logger.info('Resizing image', {
-          from: `${dimensions!.width}x${dimensions!.height}`,
+          from: `${metadata.width}x${metadata.height}`,
           to: `${newWidth}x${newHeight}`
         });
       }
 
-      // Output path
-      args.push('--out', outputPath);
-
-      // Input path
-      args.push(imagePath);
-
-      await this.runCommand('sips', args);
+      // Convert to PNG
+      await pipeline.png().toFile(outputPath);
 
       this.logger.info('Image preprocessed successfully', {
         input: imagePath,
@@ -104,54 +101,6 @@ export class FileHandler {
       // Return original path if preprocessing fails
       return imagePath;
     }
-  }
-
-  /**
-   * Get image dimensions using sips
-   */
-  private async getImageDimensions(imagePath: string): Promise<{ width: number; height: number } | null> {
-    try {
-      const output = await this.runCommand('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', imagePath]);
-
-      const widthMatch = output.match(/pixelWidth:\s*(\d+)/);
-      const heightMatch = output.match(/pixelHeight:\s*(\d+)/);
-
-      if (widthMatch && heightMatch) {
-        return {
-          width: parseInt(widthMatch[1], 10),
-          height: parseInt(heightMatch[1], 10)
-        };
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Run a command and return its output
-   */
-  private runCommand(command: string, args: string[]): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const proc = spawn(command, args);
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', (data) => { stdout += data.toString(); });
-      proc.stderr.on('data', (data) => { stderr += data.toString(); });
-
-      proc.on('close', (code) => {
-        if (code === 0) {
-          resolve(stdout);
-        } else {
-          reject(new Error(`Command failed with code ${code}: ${stderr}`));
-        }
-      });
-
-      proc.on('error', (err) => {
-        reject(err);
-      });
-    });
   }
 
   async downloadAndProcessFiles(files: any[]): Promise<ProcessedFile[]> {
@@ -194,7 +143,7 @@ export class FileHandler {
       const buffer = await response.buffer();
       const tempDir = os.tmpdir();
       const tempPath = path.join(tempDir, `slack-file-${Date.now()}-${file.name}`);
-      
+
       fs.writeFileSync(tempPath, buffer);
 
       const isImage = this.isImageFile(file.mimetype);
@@ -256,10 +205,10 @@ export class FileHandler {
 
   async formatFilePrompt(files: ProcessedFile[], userText: string): Promise<string> {
     let prompt = userText || 'Please analyze the uploaded files.';
-    
+
     if (files.length > 0) {
       prompt += '\n\nUploaded files:\n';
-      
+
       for (const file of files) {
         if (file.isImage) {
           prompt += `\n## Image: ${file.name}\n`;
@@ -269,7 +218,7 @@ export class FileHandler {
         } else if (file.isText) {
           prompt += `\n## File: ${file.name}\n`;
           prompt += `File type: ${file.mimetype}\n`;
-          
+
           try {
             const content = fs.readFileSync(file.path, 'utf-8');
             if (content.length > 10000) {
@@ -287,7 +236,7 @@ export class FileHandler {
           prompt += `Note: This is a binary file. Content analysis may be limited.\n`;
         }
       }
-      
+
       prompt += '\nPlease analyze these files and provide insights or assistance based on their content.';
     }
 

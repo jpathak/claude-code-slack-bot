@@ -7,10 +7,9 @@ import { McpManager } from './mcp-manager.js';
 import { Logger } from './logger.js';
 import { CrashDetector, CrashInfo } from './crash-detector.js';
 import { ProjectConfig } from './project-config.js';
-import { KanbanManager } from './kanban-manager.js';
+import { TaskManager } from './task-manager.js';
 import { ChannelProvisioner } from './channel-provisioner.js';
 import { WorkingDirectoryManager } from './working-directory-manager.js';
-import { BoardApiServer } from './board-api.js';
 import { BoardStore } from './board-store.js';
 import { TrelloSync } from './trello-sync.js';
 
@@ -93,16 +92,23 @@ async function recoverStuckTasks(
       const recovered: string[] = [];
 
       for (const item of items) {
+        // Skip tasks owned by Claude Code CLI - it manages its own state
+        if (item.executingAgent === 'claude-code') continue;
+
         if (item.status === 'in_progress') {
           store.moveItem(item.id, 'ready');
+          store.updateItem(item.id, { executingAgent: undefined });
           recovered.push(`#${item.id} (in_progress -> ready)`);
           recoveredCount++;
         } else if (item.status === 'planning') {
           store.moveItem(item.id, 'backlog');
+          store.updateItem(item.id, { executingAgent: undefined });
           recovered.push(`#${item.id} (planning -> backlog)`);
           recoveredCount++;
         }
       }
+
+      store.dispose();
 
       if (recovered.length > 0) {
         logger.info('Startup recovery: moved stuck tasks', {
@@ -175,29 +181,28 @@ async function start() {
     const claudeHandler = new ClaudeHandler(mcpManager);
     const slackHandler = new SlackHandler(app, claudeHandler, mcpManager);
 
-    // Initialize kanban/project components if enabled
+    // Initialize task management/project components if enabled
     let channelProvisioner: ChannelProvisioner | null = null;
     let projectConfig: ProjectConfig | null = null;
-    let kanbanManager: KanbanManager | null = null;
-    let boardApiServer: BoardApiServer | null = null;
+    let taskManager: TaskManager | null = null;
     let trelloSync: TrelloSync | null = null;
 
-    if (config.kanban.enabled) {
+    if (config.tasks.enabled) {
       projectConfig = new ProjectConfig();
-      kanbanManager = new KanbanManager(app, projectConfig);
+      taskManager = new TaskManager(app, projectConfig);
 
       // We need a reference to the WorkingDirectoryManager inside SlackHandler.
       // Since SlackHandler creates its own, we create a shared one and pass it
-      // via the kanban dependencies. The provisioner uses it to set cwds.
+      // via the task dependencies. The provisioner uses it to set cwds.
       const sharedWorkingDirManager = new WorkingDirectoryManager();
-      channelProvisioner = new ChannelProvisioner(app, projectConfig, sharedWorkingDirManager, kanbanManager);
+      channelProvisioner = new ChannelProvisioner(app, projectConfig, sharedWorkingDirManager, taskManager);
 
-      // Wire up kanban dependencies into the SlackHandler
-      slackHandler.setKanbanDependencies(kanbanManager, projectConfig, channelProvisioner);
+      // Wire up task dependencies into the SlackHandler
+      slackHandler.setTaskDependencies(taskManager, projectConfig, channelProvisioner);
 
-      logger.info('Kanban system initialized', {
-        autoProvision: config.kanban.autoProvision,
-        channelPrefix: config.kanban.channelPrefix,
+      logger.info('Task management initialized', {
+        autoProvision: config.tasks.autoProvision,
+        channelPrefix: config.tasks.channelPrefix,
       });
     }
 
@@ -206,30 +211,6 @@ async function start() {
 
     // Start the app
     await app.start();
-
-    // Start Board API server if enabled
-    if (config.boardApi.enabled && projectConfig) {
-      boardApiServer = new BoardApiServer(projectConfig);
-
-      // Wire status transition callbacks: when a task is moved via the web UI,
-      // trigger the semi-autonomous workflow (planning / implementation) in Slack.
-      boardApiServer.onStatusTransition((projectId, itemId, oldStatus, newStatus, projectPath) => {
-        slackHandler.handleExternalStatusTransition(projectId, itemId, newStatus, projectPath, oldStatus).catch(err => {
-          logger.error('Error handling external status transition', { projectId, itemId, newStatus, error: err });
-        });
-      });
-
-      try {
-        await boardApiServer.start(config.boardApi.port);
-        logger.info('Board API server running', { port: config.boardApi.port });
-      } catch (err) {
-        logger.error('Failed to start Board API server', err);
-        boardApiServer = null;
-      }
-    } else if (config.boardApi.enabled && !projectConfig) {
-      // Board API requires kanban to be enabled (for ProjectConfig)
-      logger.warn('Board API enabled but kanban is disabled. Skipping Board API server start.');
-    }
 
     // Record successful startup
     crashDetector.recordStartup();
@@ -241,17 +222,15 @@ async function start() {
       usingAnthropicAPI: !config.claude.useBedrock && !config.claude.useVertex,
       debugMode: config.debug,
       baseDirectory: config.baseDirectory || 'not set',
-      kanbanEnabled: config.kanban.enabled,
-      autoProvision: config.kanban.autoProvision,
-      boardApiEnabled: config.boardApi.enabled,
-      boardApiPort: config.boardApi.port,
+      tasksEnabled: config.tasks.enabled,
+      autoProvision: config.tasks.autoProvision,
       trelloEnabled: config.trello.enabled,
       mcpServers: mcpConfig ? Object.keys(mcpConfig.mcpServers).length : 0,
       mcpServerNames: mcpConfig ? Object.keys(mcpConfig.mcpServers) : [],
     });
 
     // Run channel provisioning sync after Slack connection is established
-    if (channelProvisioner && config.kanban.autoProvision) {
+    if (channelProvisioner && config.tasks.autoProvision) {
       setTimeout(() => {
         channelProvisioner!.syncAll().then((result) => {
           logger.info('Channel provisioning sync completed', result);
@@ -262,22 +241,33 @@ async function start() {
     }
 
     // Recover tasks stuck in transient states from a previous crash/restart
-    if (projectConfig && kanbanManager) {
+    if (projectConfig && taskManager) {
       const recoveryProjectConfig = projectConfig;
       setTimeout(() => {
         recoverStuckTasks(app, recoveryProjectConfig, logger);
       }, 4000);
     }
 
-    // Initialize Trello sync if enabled and kanban is active
+    // Initialize Trello sync if enabled and task management is active
     if (config.trello.enabled && config.trello.apiKey && config.trello.token && projectConfig) {
       trelloSync = new TrelloSync(config, projectConfig);
+
+      // Give SlackHandler a reference to TrelloSync for posting clarification comments
+      slackHandler.setTrelloSync(trelloSync);
 
       // Wire status transitions: when a card is moved on Trello,
       // trigger the semi-autonomous workflow in Slack.
       trelloSync.onStatusTransition((projectId, itemId, oldStatus, newStatus, projectPath) => {
         slackHandler.handleExternalStatusTransition(projectId, itemId, newStatus, projectPath, oldStatus).catch(err => {
           logger.error('Error handling Trello status transition', { projectId, itemId, newStatus, error: err });
+        });
+      });
+
+      // Wire clarification replies: when a user replies to a clarification comment
+      // on a Trello card, re-trigger planning with the answer.
+      trelloSync.onClarificationReply((projectId, itemId, replyText, projectPath) => {
+        slackHandler.handleTrelloClarificationReply(projectId, itemId, replyText, projectPath).catch(err => {
+          logger.error('Error handling Trello clarification reply', { projectId, itemId, error: err });
         });
       });
 
@@ -295,7 +285,7 @@ async function start() {
         }
       }, 5000);
     } else if (config.trello.enabled && !projectConfig) {
-      logger.warn('Trello sync enabled but kanban is disabled. Skipping Trello sync.');
+      logger.warn('Trello sync enabled but task management is disabled. Skipping Trello sync.');
     } else if (config.trello.enabled && (!config.trello.apiKey || !config.trello.token)) {
       logger.warn('Trello sync enabled but TRELLO_API_KEY or TRELLO_TOKEN not set. Skipping.');
     }
@@ -317,15 +307,6 @@ async function start() {
       // Stop the Trello sync
       if (trelloSync) {
         trelloSync.dispose();
-      }
-
-      // Stop the Board API server
-      if (boardApiServer) {
-        try {
-          await boardApiServer.stop();
-        } catch (err) {
-          logger.error('Error stopping Board API server during shutdown', err);
-        }
       }
 
       // Shutdown the Slack handler (stops watchers, clears intervals, aborts requests)

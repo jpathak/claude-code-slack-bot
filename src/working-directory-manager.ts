@@ -64,36 +64,86 @@ export class WorkingDirectoryManager {
   private resolveDirectory(directory: string): string | null {
     // If it's an absolute path, use it directly
     if (path.isAbsolute(directory)) {
-      if (fs.existsSync(directory)) {
-        return path.resolve(directory);
+      const resolved = path.resolve(directory);
+      // Security: Ensure the path doesn't contain path traversal sequences
+      if (this.containsPathTraversal(directory)) {
+        this.logger.warn('Path traversal detected in absolute path', { directory });
+        return null;
       }
+      if (fs.existsSync(resolved)) {
+        return resolved;
+      }
+      return null;
+    }
+
+    // Security: Check for path traversal in relative paths
+    if (this.containsPathTraversal(directory)) {
+      this.logger.warn('Path traversal detected in relative path', { directory });
       return null;
     }
 
     // If we have a base directory configured, try relative to base directory first
     if (config.baseDirectory) {
       const baseRelativePath = path.join(config.baseDirectory, directory);
-      if (fs.existsSync(baseRelativePath)) {
-        this.logger.debug('Found directory relative to base', { 
+      const resolved = path.resolve(baseRelativePath);
+
+      // Security: Ensure resolved path is still within the base directory
+      if (!resolved.startsWith(path.resolve(config.baseDirectory))) {
+        this.logger.warn('Path escapes base directory', {
+          directory,
+          resolved,
+          baseDirectory: config.baseDirectory
+        });
+        return null;
+      }
+
+      if (fs.existsSync(resolved)) {
+        this.logger.debug('Found directory relative to base', {
           input: directory,
           baseDirectory: config.baseDirectory,
-          resolved: baseRelativePath 
+          resolved
         });
-        return path.resolve(baseRelativePath);
+        return resolved;
       }
     }
 
     // Try relative to current working directory
     const cwdRelativePath = path.resolve(directory);
     if (fs.existsSync(cwdRelativePath)) {
-      this.logger.debug('Found directory relative to cwd', { 
+      this.logger.debug('Found directory relative to cwd', {
         input: directory,
-        resolved: cwdRelativePath 
+        resolved: cwdRelativePath
       });
       return cwdRelativePath;
     }
 
     return null;
+  }
+
+  /**
+   * Check if a path contains path traversal sequences.
+   * This is a security measure to prevent directory escape attacks.
+   */
+  private containsPathTraversal(inputPath: string): boolean {
+    // Normalize the path to detect hidden traversal
+    const normalized = path.normalize(inputPath);
+
+    // Check for obvious traversal patterns
+    if (inputPath.includes('..')) {
+      return true;
+    }
+
+    // Check if normalization changed a path in a way that suggests traversal
+    // (e.g., "foo/../bar" becomes "bar")
+    if (normalized !== inputPath && inputPath.includes('/')) {
+      const inputParts = inputPath.split(path.sep).filter(p => p !== '');
+      const normalizedParts = normalized.split(path.sep).filter(p => p !== '');
+      if (normalizedParts.length < inputParts.length) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   getWorkingDirectory(channelId: string, threadTs?: string, userId?: string): string | undefined {

@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { Logger } from './logger.js';
-import { BoardData, BoardColumn, KanbanItem, KanbanStatus, DEFAULT_BOARD_COLUMNS } from './types.js';
+import { BoardData, BoardColumn, TaskItem, TaskStatus, DEFAULT_BOARD_COLUMNS } from './types.js';
 
 export class BoardStore {
   private projectPath: string;
@@ -12,15 +12,16 @@ export class BoardStore {
   private watcher: fs.FSWatcher | null = null;
   private changeCallbacks: Array<() => void> = [];
   private lastWriteHash: string = '';
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(projectPath: string) {
     this.projectPath = projectPath;
-    this.boardDir = path.join(projectPath, '.kanban');
+    this.boardDir = path.join(projectPath, '.tasks');
     this.boardFile = path.join(this.boardDir, 'board.json');
   }
 
   /**
-   * Ensure the .kanban directory exists.
+   * Ensure the .tasks directory exists.
    */
   private ensureDir(): void {
     if (!fs.existsSync(this.boardDir)) {
@@ -100,11 +101,11 @@ export class BoardStore {
   /**
    * Add an item to the board. Returns the created item.
    */
-  addItem(partial: Partial<KanbanItem>): KanbanItem {
+  addItem(partial: Partial<TaskItem>): TaskItem {
     const data = this.load();
     const now = new Date().toISOString();
 
-    const item: KanbanItem = {
+    const item: TaskItem = {
       id: String(data.nextId++),
       title: partial.title || 'Untitled',
       description: partial.description,
@@ -113,6 +114,7 @@ export class BoardStore {
       source: partial.source || 'user',
       assignee: partial.assignee,
       questions: partial.questions,
+      executingAgent: partial.executingAgent,
       createdAt: now,
       updatedAt: now,
     };
@@ -127,7 +129,7 @@ export class BoardStore {
   /**
    * Update an existing item. Returns the updated item or null if not found.
    */
-  updateItem(id: string, updates: Partial<KanbanItem>): KanbanItem | null {
+  updateItem(id: string, updates: Partial<TaskItem>): TaskItem | null {
     const data = this.load();
     const item = data.items.find(i => i.id === id);
     if (!item) return null;
@@ -139,6 +141,7 @@ export class BoardStore {
     if (updates.assignee !== undefined) item.assignee = updates.assignee;
     if (updates.questions !== undefined) item.questions = updates.questions;
     if (updates.source !== undefined) item.source = updates.source;
+    if ('executingAgent' in updates) item.executingAgent = updates.executingAgent || undefined;
     item.updatedAt = new Date().toISOString();
 
     this.save(data);
@@ -150,7 +153,7 @@ export class BoardStore {
   /**
    * Move an item to a new status column.
    */
-  moveItem(id: string, newStatus: KanbanStatus): KanbanItem | null {
+  moveItem(id: string, newStatus: TaskStatus): TaskItem | null {
     return this.updateItem(id, { status: newStatus });
   }
 
@@ -172,21 +175,21 @@ export class BoardStore {
   /**
    * Get all items.
    */
-  getItems(): KanbanItem[] {
+  getItems(): TaskItem[] {
     return this.load().items;
   }
 
   /**
    * Get items filtered by status.
    */
-  getItemsByStatus(status: KanbanStatus): KanbanItem[] {
+  getItemsByStatus(status: TaskStatus): TaskItem[] {
     return this.load().items.filter(i => i.status === status);
   }
 
   /**
    * Find an item by ID, #ID, or partial title match.
    */
-  findItem(ref: string): KanbanItem | null {
+  findItem(ref: string): TaskItem | null {
     const data = this.load();
 
     // Exact ID match
@@ -240,7 +243,6 @@ export class BoardStore {
     // atomic writes (write tmp + rename).  On macOS, renaming a file into the
     // watched path emits a 'rename' event which was previously ignored.
     // Watching the directory reliably catches both direct writes and renames.
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     try {
       this.watcher = fs.watch(this.boardDir, (eventType, filename) => {
@@ -248,9 +250,9 @@ export class BoardStore {
         if (filename !== 'board.json') return;
 
         // Debounce: atomic rename can fire multiple events
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          debounceTimer = null;
+        if (this.debounceTimer) clearTimeout(this.debounceTimer);
+        this.debounceTimer = setTimeout(() => {
+          this.debounceTimer = null;
 
           // Check if this was our own write
           try {
@@ -278,6 +280,10 @@ export class BoardStore {
    * Clean up watcher and callbacks.
    */
   dispose(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
     if (this.watcher) {
       this.watcher.close();
       this.watcher = null;

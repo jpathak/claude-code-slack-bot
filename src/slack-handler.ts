@@ -16,10 +16,11 @@ import { SessionDiscovery, SessionInfo } from './session-discovery.js';
 import { SessionWatcher } from './session-watcher.js';
 import { VerbosityManager } from './verbosity-manager.js';
 import { VerbosityLevel } from './types.js';
-import { KanbanManager } from './kanban-manager.js';
+import { TaskManager } from './task-manager.js';
 import { ProjectConfig } from './project-config.js';
 import { ChannelProvisioner } from './channel-provisioner.js';
 import { TaskPlanner } from './task-planner.js';
+import { TrelloSync } from './trello-sync.js';
 
 // Tool activity tracker for summarizing work done
 export interface ToolActivityTracker {
@@ -78,9 +79,10 @@ export class SlackHandler {
   private sessionDiscovery: SessionDiscovery;
   private sessionWatcher: SessionWatcher;
   private verbosityManager: VerbosityManager;
-  private kanbanManager: KanbanManager | null = null;
+  private taskManager: TaskManager | null = null;
   private projectConfig: ProjectConfig | null = null;
   private channelProvisioner: ChannelProvisioner | null = null;
+  private trelloSync: TrelloSync | null = null;
   private taskPlanner: TaskPlanner = new TaskPlanner();
   private todoMessages: Map<string, string> = new Map(); // sessionKey -> messageTs
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
@@ -109,17 +111,24 @@ export class SlackHandler {
   }
 
   /**
-   * Set kanban-related dependencies.
-   * Called after construction when kanban is enabled.
+   * Set task-related dependencies.
+   * Called after construction when task management is enabled.
    */
-  setKanbanDependencies(
-    kanbanManager: KanbanManager,
+  setTaskDependencies(
+    taskManager: TaskManager,
     projectConfig: ProjectConfig,
     channelProvisioner: ChannelProvisioner,
   ): void {
-    this.kanbanManager = kanbanManager;
+    this.taskManager = taskManager;
     this.projectConfig = projectConfig;
     this.channelProvisioner = channelProvisioner;
+  }
+
+  /**
+   * Set TrelloSync reference for posting clarification comments on Trello cards.
+   */
+  setTrelloSync(trelloSync: TrelloSync): void {
+    this.trelloSync = trelloSync;
   }
 
   /**
@@ -270,17 +279,8 @@ export class SlackHandler {
       return;
     }
 
-    // Check if this is a kanban command
-    if (text && this.kanbanManager) {
-      const kanbanCmd = this.kanbanManager.parseCommand(text);
-      if (kanbanCmd) {
-        await this.handleKanbanCommand(kanbanCmd, channel, thread_ts || ts, say);
-        return;
-      }
-    }
-
     // Check if this is a thread reply for a task waiting for clarification
-    if (text && thread_ts && this.kanbanManager) {
+    if (text && thread_ts && this.taskManager) {
       const clarificationTask = this.findTaskWaitingForClarificationInThread(channel, thread_ts);
       if (clarificationTask) {
         this.logger.info('Detected thread reply for task waiting clarification', {
@@ -1162,219 +1162,8 @@ export class SlackHandler {
     }
   }
 
-  private async handleKanbanCommand(
-    cmd: import('./types.js').KanbanCommand,
-    channel: string,
-    threadTs: string,
-    say: any,
-  ): Promise<void> {
-    if (!this.kanbanManager) return;
-
-    try {
-      switch (cmd.type) {
-        case 'board': {
-          const items = this.kanbanManager.listItems(channel);
-          await say({
-            text: this.kanbanManager.formatBoard(items),
-            thread_ts: threadTs,
-          });
-          break;
-        }
-
-        case 'add': {
-          const item = await this.kanbanManager.addItem(channel, cmd.title, 'backlog', 'user');
-          await say({
-            text: this.kanbanManager.formatItemCreated(item),
-            thread_ts: threadTs,
-          });
-
-          // Automatically trigger planning: move to planning, send to Claude for AC generation
-          this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
-            this.logger.error('Auto-planning failed', { itemId: item.id, error: err });
-            // Recovery: move back to backlog if still stuck in planning
-            const currentItem = this.kanbanManager?.getStore(channel).findItem(item.id);
-            if (currentItem && currentItem.status === 'planning') {
-              this.kanbanManager?.getStore(channel).moveItem(item.id, 'backlog');
-            }
-          });
-          break;
-        }
-
-        case 'done': {
-          const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, 'done');
-          if (item) {
-            await say({
-              text: this.kanbanManager.formatItemMoved(item),
-              thread_ts: threadTs,
-            });
-          } else {
-            await say({
-              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
-              thread_ts: threadTs,
-            });
-          }
-          break;
-        }
-
-        case 'move': {
-          // Capture old status before the move for re-entry detection
-          const preMove = this.kanbanManager.getStore(channel).findItem(cmd.ref);
-          const oldMoveStatus = preMove?.status;
-          const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, cmd.status);
-          if (item) {
-            await say({
-              text: this.kanbanManager.formatItemMoved(item),
-              thread_ts: threadTs,
-            });
-
-            // Trigger semi-autonomous workflows based on destination status
-            if (cmd.status === 'planning') {
-              this.triggerTaskPlanning(channel, item.id, threadTs, say).catch(err => {
-                this.logger.error('Auto-planning failed after move', { itemId: item.id, error: err });
-                const currentItem = this.kanbanManager?.getStore(channel).findItem(item.id);
-                if (currentItem && currentItem.status === 'planning') {
-                  this.kanbanManager?.getStore(channel).moveItem(item.id, 'backlog');
-                }
-              });
-            } else if (cmd.status === 'ready') {
-              // Task moved to "ready" - prompt user to approve with "go" command
-              await say({
-                text: `📋 Task *#${item.id}* is ready for implementation. Use \`go ${item.id}\` to approve and start.`,
-                thread_ts: threadTs,
-              });
-            } else if (cmd.status === 'in_progress') {
-              // Direct move to in_progress triggers implementation
-              const isRetry = oldMoveStatus === 'review';
-              this.triggerTaskImplementation(channel, item.id, threadTs, say, isRetry).catch(err => {
-                this.logger.error('Auto-implementation failed after move', { itemId: item.id, error: err });
-                const currentItem = this.kanbanManager?.getStore(channel).findItem(item.id);
-                if (currentItem && currentItem.status === 'in_progress') {
-                  this.kanbanManager?.getStore(channel).moveItem(item.id, 'ready');
-                }
-              });
-            }
-          } else {
-            await say({
-              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
-              thread_ts: threadTs,
-            });
-          }
-          break;
-        }
-
-        case 'go': {
-          const store = this.kanbanManager.getStore(channel);
-          const goItem = store.findItem(cmd.ref);
-          if (goItem) {
-            const isRetry = goItem.status === 'review';
-            store.moveItem(goItem.id, 'in_progress');
-            const emoji = isRetry ? '🔄' : '🚀';
-            const label = isRetry ? 'Retrying implementation' : 'Approved for implementation! Moving to *In Progress*';
-            await say({
-              text: `${emoji} Task *#${goItem.id}* ${label}: ${goItem.title}`,
-              thread_ts: threadTs,
-            });
-
-            // Send the task to Claude for implementation
-            this.triggerTaskImplementation(channel, goItem.id, threadTs, say, isRetry).catch(err => {
-              this.logger.error('Task implementation trigger failed', { itemId: goItem.id, error: err });
-              const currentItem = store.findItem(goItem.id);
-              if (currentItem && currentItem.status === 'in_progress') {
-                store.moveItem(goItem.id, 'ready');
-              }
-            });
-          } else {
-            await say({
-              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
-              thread_ts: threadTs,
-            });
-          }
-          break;
-        }
-
-        case 'answer': {
-          const store = this.kanbanManager.getStore(channel);
-          const found = store.findItem(cmd.ref);
-          if (found) {
-            // Clear questions and move back to planning
-            const updated = store.updateItem(found.id, {
-              questions: [],
-              status: 'planning',
-              description: (found.description || '') + `\n\n**Answer:** ${cmd.response}`,
-              clarificationThreadTs: undefined, // Clear the thread association
-            });
-            if (updated) {
-              await say({
-                text: `💬 Answer recorded for task *#${updated.id}*. Re-planning with new context...\n> ${cmd.response}`,
-                thread_ts: threadTs,
-              });
-
-              // Re-trigger planning with auto-implementation if no more questions
-              this.triggerTaskPlanningWithAutoImplement(channel, updated.id, threadTs, say).catch(err => {
-                this.logger.error('Re-planning failed after answer', { itemId: updated.id, error: err });
-                const currentItem = this.kanbanManager?.getStore(channel).findItem(updated.id);
-                if (currentItem && currentItem.status === 'planning') {
-                  this.kanbanManager?.getStore(channel).moveItem(updated.id, 'backlog');
-                }
-              });
-            }
-          } else {
-            await say({
-              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
-              thread_ts: threadTs,
-            });
-          }
-          break;
-        }
-
-        case 'approve': {
-          const item = await this.kanbanManager.updateItemStatus(channel, cmd.ref, 'done');
-          if (item) {
-            await say({
-              text: `✅ Task *#${item.id}* approved and marked *Done*: ${item.title}`,
-              thread_ts: threadTs,
-            });
-          } else {
-            await say({
-              text: `❌ Task not found: \`${cmd.ref}\`. Use \`board\` to see all tasks.`,
-              thread_ts: threadTs,
-            });
-          }
-          break;
-        }
-
-        case 'sync': {
-          if (this.channelProvisioner) {
-            await say({
-              text: '🔄 Syncing projects...',
-              thread_ts: threadTs,
-            });
-            const result = await this.channelProvisioner.syncAll();
-            await say({
-              text: `✅ Sync complete: ${result.scanned} scanned, ${result.created} created, ${result.adopted} adopted, ${result.skipped} skipped` +
-                (result.errors.length > 0 ? `\n⚠️ Errors: ${result.errors.join('; ')}` : ''),
-              thread_ts: threadTs,
-            });
-          } else {
-            await say({
-              text: '❌ Channel provisioner not configured.',
-              thread_ts: threadTs,
-            });
-          }
-          break;
-        }
-      }
-    } catch (error) {
-      this.logger.error('Error handling kanban command', { cmd, error });
-      await say({
-        text: `❌ Error: ${(error as Error).message}`,
-        thread_ts: threadTs,
-      });
-    }
-  }
-
   /**
-   * Public: handle a status transition triggered externally (e.g. from web UI via board API or Trello).
+   * Public: handle a status transition triggered externally (e.g. from Trello).
    * Posts updates to the project's Slack channel and triggers appropriate workflows.
    */
   async handleExternalStatusTransition(
@@ -1384,6 +1173,16 @@ export class SlackHandler {
     projectPath: string,
     oldStatus?: string,
   ): Promise<void> {
+    // Skip notifications for Claude Code-driven changes
+    if (this.taskManager) {
+      const store = this.taskManager.getStore(channelId);
+      const currentItem = store.findItem(itemId);
+      if (currentItem?.executingAgent === 'claude-code') {
+        this.logger.info('Skipping Slack notification for claude-code driven change', { itemId });
+        return;
+      }
+    }
+
     const makeSay = (channelId: string, threadTs: string) => {
       return async (msg: { text: string; thread_ts?: string }) => {
         return await this.app.client.chat.postMessage({
@@ -1407,18 +1206,24 @@ export class SlackHandler {
       await this.triggerTaskPlanning(channelId, itemId, threadTs, makeSay(channelId, threadTs));
     } else if (newStatus === 'clarification_needed') {
       // Task moved to clarification_needed via board - post the questions if available
-      if (!this.kanbanManager) return;
-      const store = this.kanbanManager.getStore(channelId);
+      if (!this.taskManager) return;
+      const store = this.taskManager.getStore(channelId);
       const item = store.findItem(itemId);
       if (item && item.questions && item.questions.length > 0) {
         const questionList = item.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
         const result = await this.app.client.chat.postMessage({
           channel: channelId,
-          text: `❓ Task *#${itemId}* moved to *Clarification Needed* (via board):\n${questionList}\n\nReply in this thread with your answers.`,
+          text: `❓ Task *#${itemId}* moved to *Clarification Needed* (via board):\n${questionList}\n\nReply in this thread or comment on the Trello card.`,
         });
         // Track the thread for clarification replies
         if (result.ts) {
           store.updateItem(itemId, { clarificationThreadTs: result.ts });
+        }
+        // Also post clarification questions on the Trello card
+        if (this.trelloSync) {
+          this.trelloSync.postClarificationComment(projectPath, itemId, item.questions).catch(err => {
+            this.logger.warn('Failed to post Trello clarification comment', { itemId, error: err });
+          });
         }
       } else {
         await this.app.client.chat.postMessage({
@@ -1434,6 +1239,19 @@ export class SlackHandler {
       });
     } else if (newStatus === 'in_progress') {
       // Direct move to in_progress via board triggers implementation
+      // Agent coordination: check if another agent has claimed this task
+      if (this.taskManager) {
+        const implStore = this.taskManager.getStore(channelId);
+        const implItem = implStore.findItem(itemId);
+        if (implItem?.executingAgent && implItem.executingAgent !== 'slack-bot') {
+          await this.app.client.chat.postMessage({
+            channel: channelId,
+            text: `⚠️ Task *#${itemId}* is currently being executed by *${implItem.executingAgent}*. Slack bot will not start implementation.`,
+          });
+          return;
+        }
+      }
+
       const isRetry = oldStatus === 'review';
       const wasWaitingClarification = oldStatus === 'clarification_needed';
       let label = 'Starting implementation';
@@ -1478,11 +1296,23 @@ export class SlackHandler {
     threadTs: string,
     say: any,
   ): Promise<void> {
-    if (!this.kanbanManager) return;
+    if (!this.taskManager) return;
 
-    const store = this.kanbanManager.getStore(channel);
+    const store = this.taskManager.getStore(channel);
     const planResult = await this.taskPlanner.processNewTask(store, itemId);
     if (!planResult) return;
+
+    // Agent coordination: check if another agent is already executing this task
+    const currentItem = store.findItem(itemId);
+    if (currentItem?.executingAgent && currentItem.executingAgent !== 'slack-bot') {
+      this.logger.warn('Task claimed by another agent, skipping planning', {
+        itemId, executingAgent: currentItem.executingAgent,
+      });
+      return;
+    }
+
+    // Claim the task for this agent
+    store.updateItem(itemId, { executingAgent: 'slack-bot' });
 
     await say({
       text: `📐 Planning task *#${planResult.item.id}*: generating acceptance criteria...`,
@@ -1508,9 +1338,9 @@ export class SlackHandler {
     // Timeout watchdog
     const timeoutHandle = setTimeout(() => {
       timedOut = true;
-      this.logger.warn('Planning timed out', { itemId, timeoutMs: config.kanban.planningTimeoutMs });
+      this.logger.warn('Planning timed out', { itemId, timeoutMs: config.tasks.planningTimeoutMs });
       abortController.abort();
-    }, config.kanban.planningTimeoutMs);
+    }, config.tasks.planningTimeoutMs);
 
     // Post initial status message that we'll update with progress
     const statusResult = await say({
@@ -1591,13 +1421,15 @@ export class SlackHandler {
       this.logger.error('Planning query failed', { itemId, error: err });
 
       // Move task back to backlog so it can be re-planned
-      const currentItem = store.findItem(itemId);
-      if (currentItem && currentItem.status === 'planning') {
+      const failedItem = store.findItem(itemId);
+      if (failedItem && failedItem.status === 'planning') {
         store.moveItem(itemId, 'backlog');
       }
+      // Release agent claim on failure
+      store.updateItem(itemId, { executingAgent: undefined });
 
       const errMsg = timedOut
-        ? `Auto-planning for task *#${itemId}* timed out after ${Math.round(config.kanban.planningTimeoutMs / 60000)} minutes. Task moved back to *Backlog*.`
+        ? `Auto-planning for task *#${itemId}* timed out after ${Math.round(config.tasks.planningTimeoutMs / 60000)} minutes. Task moved back to *Backlog*.`
         : `Auto-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}. Task moved back to *Backlog*.`;
 
       if (statusMessageTs) {
@@ -1625,15 +1457,25 @@ export class SlackHandler {
     const updated = await this.taskPlanner.applyPlanningResult(store, itemId, planningOutput);
     if (!updated) return;
 
+    // Release agent claim after planning completes
+    store.updateItem(itemId, { executingAgent: undefined });
+
     if (updated.status === 'clarification_needed' && updated.questions?.length) {
       // Track the thread where clarification is being requested
       store.updateItem(updated.id, { clarificationThreadTs: threadTs });
 
       const questionList = updated.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
       await say({
-        text: `❓ Task *#${updated.id}* needs clarification:\n${questionList}\n\nReply in this thread with your answers, or use \`answer ${updated.id} <your response>\`.`,
+        text: `❓ Task *#${updated.id}* needs clarification:\n${questionList}\n\nReply in this thread with your answers, or comment on the Trello card.`,
         thread_ts: threadTs,
       });
+
+      // Also post clarification questions as a comment on the Trello card
+      if (this.trelloSync && workingDirectory) {
+        this.trelloSync.postClarificationComment(workingDirectory, updated.id, updated.questions).catch(err => {
+          this.logger.warn('Failed to post Trello clarification comment', { itemId: updated.id, error: err });
+        });
+      }
     } else {
       const acCount = updated.acceptanceCriteria?.length ?? 0;
       const specPath = workingDirectory ? `.specs/${updated.id}/plan.md` : '';
@@ -1657,11 +1499,26 @@ export class SlackHandler {
     say: any,
     isRetry: boolean = false,
   ): Promise<void> {
-    if (!this.kanbanManager) return;
+    if (!this.taskManager) return;
 
-    const store = this.kanbanManager.getStore(channel);
+    const store = this.taskManager.getStore(channel);
     const item = store.findItem(itemId);
     if (!item) return;
+
+    // Agent coordination: check if another agent is already executing this task
+    if (item.executingAgent && item.executingAgent !== 'slack-bot') {
+      this.logger.warn('Task claimed by another agent, skipping implementation', {
+        itemId, executingAgent: item.executingAgent,
+      });
+      await say({
+        text: `⚠️ Task *#${itemId}* is currently being executed by *${item.executingAgent}*. Skipping.`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Claim the task for this agent
+    store.updateItem(item.id, { executingAgent: 'slack-bot' });
 
     const mapping = this.projectConfig?.getByChannelId(channel);
     const workingDirectory = mapping?.projectPath;
@@ -1697,9 +1554,9 @@ export class SlackHandler {
     // Timeout watchdog
     const timeoutHandle = setTimeout(() => {
       timedOut = true;
-      this.logger.warn('Implementation timed out', { itemId, timeoutMs: config.kanban.implementationTimeoutMs });
+      this.logger.warn('Implementation timed out', { itemId, timeoutMs: config.tasks.implementationTimeoutMs });
       abortController.abort();
-    }, config.kanban.implementationTimeoutMs);
+    }, config.tasks.implementationTimeoutMs);
 
     // Post status message that we'll update with progress
     const statusResult = await say({
@@ -1792,9 +1649,11 @@ export class SlackHandler {
       if (currentItem && currentItem.status === 'in_progress') {
         store.moveItem(itemId, 'ready');
       }
+      // Release agent claim on failure
+      store.updateItem(itemId, { executingAgent: undefined });
 
       const errMsg = timedOut
-        ? `Implementation of task *#${item.id}* timed out after ${Math.round(config.kanban.implementationTimeoutMs / 60000)} minutes. Task moved back to *Ready*.`
+        ? `Implementation of task *#${item.id}* timed out after ${Math.round(config.tasks.implementationTimeoutMs / 60000)} minutes. Task moved back to *Ready*.`
         : `Implementation of task *#${item.id}* encountered an error: ${(err as Error).message || 'Unknown error'}. Task moved back to *Ready*.`;
 
       if (statusMessageTs) {
@@ -1812,8 +1671,9 @@ export class SlackHandler {
       this.taskPlanner.saveImplementationSpec(workingDirectory, item, lastTextOutput);
     }
 
-    // Move to review
+    // Move to review and release agent claim
     store.moveItem(item.id, 'review');
+    store.updateItem(item.id, { executingAgent: undefined });
 
     // Update status message with final summary
     const toolSummary = tracker.toolNames.size > 0 ? ` — ${formatToolSummary(tracker)}` : '';
@@ -1853,10 +1713,10 @@ export class SlackHandler {
   private findTaskWaitingForClarificationInThread(
     channel: string,
     threadTs: string,
-  ): import('./types.js').KanbanItem | null {
-    if (!this.kanbanManager) return null;
+  ): import('./types.js').TaskItem | null {
+    if (!this.taskManager) return null;
 
-    const store = this.kanbanManager.getStore(channel);
+    const store = this.taskManager.getStore(channel);
     const items = store.getItems();
 
     // Find a task in clarification_needed state that is associated with this thread
@@ -1874,14 +1734,14 @@ export class SlackHandler {
    */
   private async handleClarificationReply(
     channel: string,
-    task: import('./types.js').KanbanItem,
+    task: import('./types.js').TaskItem,
     answerText: string,
     threadTs: string,
     say: any,
   ): Promise<void> {
-    if (!this.kanbanManager) return;
+    if (!this.taskManager) return;
 
-    const store = this.kanbanManager.getStore(channel);
+    const store = this.taskManager.getStore(channel);
 
     // Clear questions, append answer to description, and move back to planning
     const updated = store.updateItem(task.id, {
@@ -1910,6 +1770,44 @@ export class SlackHandler {
   }
 
   /**
+   * Handle a clarification reply from a Trello card comment.
+   * Creates a new Slack thread and re-triggers planning with the answer.
+   */
+  async handleTrelloClarificationReply(
+    channelId: string,
+    itemId: string,
+    answerText: string,
+    projectPath: string,
+  ): Promise<void> {
+    if (!this.taskManager) return;
+
+    const store = this.taskManager.getStore(channelId);
+    const task = store.findItem(itemId);
+    if (!task) {
+      this.logger.warn('Trello clarification reply for unknown task', { itemId });
+      return;
+    }
+
+    // Post a new message in Slack to track the re-planning
+    const result = await this.app.client.chat.postMessage({
+      channel: channelId,
+      text: `💬 Clarification received for task *#${itemId}* (via Trello comment). Re-planning...`,
+    });
+    const threadTs = result.ts!;
+
+    const say = async (msg: { text: string; thread_ts?: string }) => {
+      return await this.app.client.chat.postMessage({
+        channel: channelId,
+        thread_ts: msg.thread_ts ?? threadTs,
+        text: msg.text,
+      });
+    };
+
+    // Reuse existing clarification reply logic
+    await this.handleClarificationReply(channelId, task, answerText, threadTs, say);
+  }
+
+  /**
    * Trigger planning and automatically start implementation if no questions remain.
    * Used after clarification is provided to streamline the workflow.
    */
@@ -1919,11 +1817,23 @@ export class SlackHandler {
     threadTs: string,
     say: any,
   ): Promise<void> {
-    if (!this.kanbanManager) return;
+    if (!this.taskManager) return;
 
-    const store = this.kanbanManager.getStore(channel);
+    const store = this.taskManager.getStore(channel);
     const planResult = await this.taskPlanner.processNewTask(store, itemId);
     if (!planResult) return;
+
+    // Agent coordination: check if another agent is already executing this task
+    const autoImplCurrentItem = store.findItem(itemId);
+    if (autoImplCurrentItem?.executingAgent && autoImplCurrentItem.executingAgent !== 'slack-bot') {
+      this.logger.warn('Task claimed by another agent, skipping re-planning', {
+        itemId, executingAgent: autoImplCurrentItem.executingAgent,
+      });
+      return;
+    }
+
+    // Claim the task for this agent
+    store.updateItem(itemId, { executingAgent: 'slack-bot' });
 
     await say({
       text: `📐 Re-planning task *#${planResult.item.id}* with clarification...`,
@@ -1949,9 +1859,9 @@ export class SlackHandler {
     // Timeout watchdog
     const timeoutHandle = setTimeout(() => {
       timedOut = true;
-      this.logger.warn('Re-planning timed out', { itemId, timeoutMs: config.kanban.planningTimeoutMs });
+      this.logger.warn('Re-planning timed out', { itemId, timeoutMs: config.tasks.planningTimeoutMs });
       abortController.abort();
-    }, config.kanban.planningTimeoutMs);
+    }, config.tasks.planningTimeoutMs);
 
     // Post initial status message that we'll update with progress
     const statusResult = await say({
@@ -2032,13 +1942,15 @@ export class SlackHandler {
       this.logger.error('Re-planning query failed', { itemId, error: err });
 
       // Move task back to backlog so it can be re-planned
-      const currentItem = store.findItem(itemId);
-      if (currentItem && currentItem.status === 'planning') {
+      const replanFailedItem = store.findItem(itemId);
+      if (replanFailedItem && replanFailedItem.status === 'planning') {
         store.moveItem(itemId, 'backlog');
       }
+      // Release agent claim on failure
+      store.updateItem(itemId, { executingAgent: undefined });
 
       const errMsg = timedOut
-        ? `Re-planning for task *#${itemId}* timed out after ${Math.round(config.kanban.planningTimeoutMs / 60000)} minutes. Task moved back to *Backlog*.`
+        ? `Re-planning for task *#${itemId}* timed out after ${Math.round(config.tasks.planningTimeoutMs / 60000)} minutes. Task moved back to *Backlog*.`
         : `Re-planning for task *#${itemId}* failed: ${(err as Error).message || 'Unknown error'}. Task moved back to *Backlog*.`;
 
       if (statusMessageTs) {
@@ -2066,15 +1978,25 @@ export class SlackHandler {
     const updated = await this.taskPlanner.applyPlanningResult(store, itemId, planningOutput);
     if (!updated) return;
 
+    // Release agent claim after re-planning completes
+    store.updateItem(itemId, { executingAgent: undefined });
+
     if (updated.status === 'clarification_needed' && updated.questions?.length) {
       // Still has questions - need more clarification
       store.updateItem(updated.id, { clarificationThreadTs: threadTs });
 
       const questionList = updated.questions.map((q, i) => `  ${i + 1}. ${q}`).join('\n');
       await say({
-        text: `❓ Task *#${updated.id}* still needs clarification:\n${questionList}\n\nReply in this thread with your answers.`,
+        text: `❓ Task *#${updated.id}* still needs clarification:\n${questionList}\n\nReply in this thread or comment on the Trello card.`,
         thread_ts: threadTs,
       });
+
+      // Also post on Trello card
+      if (this.trelloSync && workingDirectory) {
+        this.trelloSync.postClarificationComment(workingDirectory, updated.id, updated.questions).catch(err => {
+          this.logger.warn('Failed to post Trello clarification comment', { itemId: updated.id, error: err });
+        });
+      }
     } else {
       // No more questions! Auto-start implementation instead of waiting for manual "go"
       const acCount = updated.acceptanceCriteria?.length ?? 0;
@@ -2124,7 +2046,7 @@ export class SlackHandler {
         const mapping = this.projectConfig.getByChannelId(channelId);
         if (mapping) {
           await say({
-            text: `👋 Hi! This channel is auto-mapped to \`${mapping.projectPath}\`.\n\nJust start chatting - no \`cwd\` needed!\n\nCommands: \`board\` (kanban), \`add task <desc>\`, \`done <ref>\`, \`sync\``,
+            text: `👋 Hi! This channel is auto-mapped to \`${mapping.projectPath}\`.\n\nJust start chatting - no \`cwd\` needed!\n\nTasks are synced to Trello automatically.`,
           });
           this.logger.info('Sent provisioned welcome to channel', { channelId, channelName });
           return;
@@ -2481,7 +2403,7 @@ export class SlackHandler {
     }
 
     // Recover stuck tasks before aborting active controllers
-    if (this.kanbanManager) {
+    if (this.taskManager) {
       for (const [sessionKey] of this.activeControllers) {
         try {
           // Parse session key to determine task type and channel
@@ -2496,7 +2418,7 @@ export class SlackHandler {
 
           if (!channel) continue;
 
-          const store = this.kanbanManager.getStore(channel);
+          const store = this.taskManager.getStore(channel);
           const items = store.getItems();
 
           if (prefix === 'SYSTEM_IMPL') {
@@ -2504,6 +2426,7 @@ export class SlackHandler {
             for (const item of items) {
               if (item.status === 'in_progress') {
                 store.moveItem(item.id, 'ready');
+                store.updateItem(item.id, { executingAgent: undefined });
                 this.logger.info('Shutdown recovery: moved in_progress task to ready', { itemId: item.id, channel });
               }
             }
@@ -2512,6 +2435,7 @@ export class SlackHandler {
             for (const item of items) {
               if (item.status === 'planning') {
                 store.moveItem(item.id, 'backlog');
+                store.updateItem(item.id, { executingAgent: undefined });
                 this.logger.info('Shutdown recovery: moved planning task to backlog', { itemId: item.id, channel });
               }
             }

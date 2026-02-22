@@ -29,8 +29,7 @@ function createTestConfig(overrides: Partial<Config['trello']> = {}): Config {
     debug: false,
     selfDebugOnCrash: false,
     defaultVerbosity: 'normal',
-    kanban: { enabled: true, autoProvision: false, channelPrefix: 'proj-' },
-    boardApi: { port: 7000, enabled: false },
+    tasks: { enabled: true, autoProvision: false, channelPrefix: 'proj-', implementationTimeoutMs: 1800000, planningTimeoutMs: 600000 },
     trello: {
       enabled: true,
       apiKey: 'test-api-key',
@@ -149,12 +148,12 @@ describe('TrelloSync', () => {
 
   describe('mapping persistence', () => {
     it('should save and load Trello mapping', async () => {
-      const mappingPath = path.join(tmpDir, '.kanban', 'trello-mapping.json');
+      const mappingPath = path.join(tmpDir, '.tasks', 'trello-mapping.json');
 
       // Setup: create board and lists via mocked API
       mockTrelloApi({
         'GET /members/me/boards': () => [],
-        'POST /boards': () => ({ id: 'board-1', name: 'test-project Kanban', url: 'https://trello.com/b/abc' }),
+        'POST /boards': () => ({ id: 'board-1', name: 'test-project', url: 'https://trello.com/b/abc' }),
         'GET /boards/board-1/lists': () => [],
         'POST /lists': (url: string) => {
           const body = JSON.parse((mockFetch.mock.calls.find(
@@ -182,9 +181,9 @@ describe('TrelloSync', () => {
     });
 
     it('should handle corrupted mapping file gracefully', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), '{invalid', 'utf-8');
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), '{invalid', 'utf-8');
 
       // Should not throw, returns null internally
       await trelloSync.syncOutbound('C123', tmpDir);
@@ -199,7 +198,7 @@ describe('TrelloSync', () => {
     it('should find existing board instead of creating new one', async () => {
       mockTrelloApi({
         'GET /members/me/boards': () => [
-          { id: 'existing-board', name: 'test-project Kanban', url: 'https://trello.com/b/existing', closed: false },
+          { id: 'existing-board', name: 'test-project', url: 'https://trello.com/b/existing', closed: false },
         ],
         'GET /boards/existing-board/lists': () => [
           { id: 'list-1', name: 'Backlog', closed: false, pos: 1024 },
@@ -223,8 +222,8 @@ describe('TrelloSync', () => {
 
     it('should preserve existing card mappings on re-initialization', async () => {
       // Pre-create a mapping with existing card entries (simulating a bot restart)
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
 
       const existingMapping = {
         version: 1,
@@ -256,7 +255,7 @@ describe('TrelloSync', () => {
           },
         ],
       };
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify(existingMapping, null, 2), 'utf-8');
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify(existingMapping, null, 2), 'utf-8');
 
       // Also create matching local items so outbound sync doesn't try to delete them
       const store = new BoardStore(tmpDir);
@@ -266,7 +265,7 @@ describe('TrelloSync', () => {
 
       mockTrelloApi({
         'GET /members/me/boards': () => [
-          { id: 'board-1', name: 'test-project Kanban', url: 'https://trello.com/b/new', closed: false },
+          { id: 'board-1', name: 'test-project', url: 'https://trello.com/b/new', closed: false },
         ],
         'GET /boards/board-1/lists': () => [
           { id: 'list-1', name: 'Backlog', closed: false, pos: 1024 },
@@ -282,7 +281,7 @@ describe('TrelloSync', () => {
       await trelloSync.initializeProject('C123', tmpDir, 'test-project');
 
       // Verify the mapping preserved the existing card entries
-      const mappingPath = path.join(kanbanDir, 'trello-mapping.json');
+      const mappingPath = path.join(tasksDir, 'trello-mapping.json');
       const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'));
 
       // Board/list IDs should be updated
@@ -304,7 +303,7 @@ describe('TrelloSync', () => {
     it('should create missing lists on existing board', async () => {
       mockTrelloApi({
         'GET /members/me/boards': () => [
-          { id: 'board-1', name: 'test-project Kanban', url: 'https://trello.com/b/abc', closed: false },
+          { id: 'board-1', name: 'test-project', url: 'https://trello.com/b/abc', closed: false },
         ],
         'GET /boards/board-1/lists': () => [
           { id: 'list-1', name: 'Backlog', closed: false, pos: 1024 },
@@ -332,9 +331,9 @@ describe('TrelloSync', () => {
 
   describe('outbound sync', () => {
     function setupMappingWithLists(): void {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -374,7 +373,7 @@ describe('TrelloSync', () => {
       expect(createdCard.idList).toBe('list-backlog');
 
       // Verify mapping was updated
-      const mapping = JSON.parse(fs.readFileSync(path.join(tmpDir, '.kanban', 'trello-mapping.json'), 'utf-8'));
+      const mapping = JSON.parse(fs.readFileSync(path.join(tmpDir, '.tasks', 'trello-mapping.json'), 'utf-8'));
       expect(mapping.cards).toHaveLength(1);
       expect(mapping.cards[0].localId).toBe('1');
       expect(mapping.cards[0].trelloCardId).toBe('trello-card-1');
@@ -414,7 +413,7 @@ describe('TrelloSync', () => {
       setupMappingWithLists();
 
       // Setup mapping with an existing card
-      const mappingPath = path.join(tmpDir, '.kanban', 'trello-mapping.json');
+      const mappingPath = path.join(tmpDir, '.tasks', 'trello-mapping.json');
       const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'));
       mapping.cards.push({
         localId: '999',
@@ -477,9 +476,9 @@ describe('TrelloSync', () => {
 
   describe('inbound sync', () => {
     function setupMappingWithBoard(): void {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -517,7 +516,7 @@ describe('TrelloSync', () => {
       store.dispose();
 
       // Verify mapping was updated
-      const mapping = JSON.parse(fs.readFileSync(path.join(tmpDir, '.kanban', 'trello-mapping.json'), 'utf-8'));
+      const mapping = JSON.parse(fs.readFileSync(path.join(tmpDir, '.tasks', 'trello-mapping.json'), 'utf-8'));
       expect(mapping.cards).toHaveLength(1);
       expect(mapping.cards[0].trelloCardId).toBe('trello-new-1');
     });
@@ -530,7 +529,7 @@ describe('TrelloSync', () => {
       const item = store.addItem({ title: 'Movable Task', status: 'backlog' });
       store.dispose();
 
-      const mappingPath = path.join(tmpDir, '.kanban', 'trello-mapping.json');
+      const mappingPath = path.join(tmpDir, '.tasks', 'trello-mapping.json');
       const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'));
       // We need a hash that matches the old state
       mapping.cards.push({
@@ -576,7 +575,7 @@ describe('TrelloSync', () => {
       store.addItem({ title: 'To be deleted', status: 'backlog' });
       store.dispose();
 
-      const mappingPath = path.join(tmpDir, '.kanban', 'trello-mapping.json');
+      const mappingPath = path.join(tmpDir, '.tasks', 'trello-mapping.json');
       const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'));
       mapping.cards.push({
         localId: '1',
@@ -613,7 +612,7 @@ describe('TrelloSync', () => {
       store.dispose();
 
       // Setup mapping with correct hash
-      const mappingPath = path.join(tmpDir, '.kanban', 'trello-mapping.json');
+      const mappingPath = path.join(tmpDir, '.tasks', 'trello-mapping.json');
       const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'));
 
       // Compute the same hash the sync module will compute
@@ -653,9 +652,9 @@ describe('TrelloSync', () => {
 
   describe('echo prevention', () => {
     it('should skip recently pushed cards during inbound sync', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -740,8 +739,8 @@ describe('TrelloSync', () => {
 
   describe('status transitions', () => {
     function setupMappingAndItem(): { itemId: string } {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
 
       const store = new BoardStore(tmpDir);
       const item = store.addItem({ title: 'Transition Task', status: 'backlog' });
@@ -768,7 +767,7 @@ describe('TrelloSync', () => {
           lastTrelloHash: 'old-hash',
         }],
       };
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify(mapping, null, 2), 'utf-8');
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify(mapping, null, 2), 'utf-8');
 
       return { itemId: item.id };
     }
@@ -815,8 +814,8 @@ describe('TrelloSync', () => {
     });
 
     it('should not fire callback when status does not change', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
 
       const store = new BoardStore(tmpDir);
       store.addItem({ title: 'Static Task', status: 'backlog' });
@@ -847,7 +846,7 @@ describe('TrelloSync', () => {
           lastTrelloHash: hash,
         }],
       };
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify(mapping, null, 2), 'utf-8');
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify(mapping, null, 2), 'utf-8');
 
       let callbackFired = false;
       trelloSync.onStatusTransition(() => { callbackFired = true; });
@@ -890,9 +889,9 @@ describe('TrelloSync', () => {
     it('should produce matching hashes for items with Local ID footer', async () => {
       // This tests the fix: hashItem now strips the Local ID footer before hashing,
       // so outbound hashes match inbound hashes (hashCard also strips it).
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -942,7 +941,7 @@ describe('TrelloSync', () => {
       });
 
       // Read the updated mapping after outbound sync
-      const mapping = JSON.parse(fs.readFileSync(path.join(kanbanDir, 'trello-mapping.json'), 'utf-8'));
+      const mapping = JSON.parse(fs.readFileSync(path.join(tasksDir, 'trello-mapping.json'), 'utf-8'));
       expect(mapping.cards).toHaveLength(1);
 
       await trelloSync.syncInbound('C123', tmpDir);
@@ -962,9 +961,9 @@ describe('TrelloSync', () => {
 
   describe('outbound blocked during inbound', () => {
     it('should skip outbound sync while inbound is running', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -1003,7 +1002,7 @@ describe('TrelloSync', () => {
       expect(items[0].title).toBe('Race Card');
 
       // Verify the mapping was saved immediately (no race window)
-      const mapping = JSON.parse(fs.readFileSync(path.join(kanbanDir, 'trello-mapping.json'), 'utf-8'));
+      const mapping = JSON.parse(fs.readFileSync(path.join(tasksDir, 'trello-mapping.json'), 'utf-8'));
       expect(mapping.cards).toHaveLength(1);
       expect(mapping.cards[0].trelloCardId).toBe('trello-race-1');
 
@@ -1032,8 +1031,8 @@ describe('TrelloSync', () => {
 
   describe('description corruption prevention', () => {
     it('should NOT overwrite item.description with formatted card description on inbound', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
 
       // Create a local item with raw description + acceptance criteria
       const store = new BoardStore(tmpDir);
@@ -1046,7 +1045,7 @@ describe('TrelloSync', () => {
       store.dispose();
 
       // Setup mapping with old hash so inbound sees a "change"
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -1097,8 +1096,8 @@ describe('TrelloSync', () => {
     });
 
     it('should update description when user actually edits it on Trello', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
 
       const store = new BoardStore(tmpDir);
       const item = store.addItem({
@@ -1108,7 +1107,7 @@ describe('TrelloSync', () => {
       });
       store.dispose();
 
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -1156,9 +1155,9 @@ describe('TrelloSync', () => {
 
   describe('card description format', () => {
     it('should include Local ID footer in created cards', async () => {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',
@@ -1211,9 +1210,9 @@ describe('TrelloSync', () => {
 
   describe('status transition for new and recovered cards', () => {
     function setupMappingForTransitionTests() {
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'trello-mapping.json'), JSON.stringify({
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'trello-mapping.json'), JSON.stringify({
         version: 1,
         boardId: 'board-1',
         boardUrl: 'https://trello.com/b/abc',

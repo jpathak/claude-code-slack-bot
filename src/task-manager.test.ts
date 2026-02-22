@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { KanbanManager } from './kanban-manager.js';
+import { TaskManager } from './task-manager.js';
 import { ProjectConfig } from './project-config.js';
 import * as os from 'os';
 import * as path from 'path';
@@ -23,15 +23,15 @@ function createIsolatedProjectConfig(tmpDir: string) {
   return new ProjectConfig(configPath);
 }
 
-describe('KanbanManager', () => {
+describe('TaskManager', () => {
   let app: any;
   let projectConfig: ProjectConfig;
-  let manager: KanbanManager;
+  let manager: TaskManager;
   let tmpDir: string;
 
   beforeEach(() => {
     // Create a unique temp dir for each test
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kanban-test-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-test-'));
     app = createMockApp();
     projectConfig = createIsolatedProjectConfig(tmpDir);
 
@@ -46,7 +46,7 @@ describe('KanbanManager', () => {
       lastSyncedAt: new Date().toISOString(),
     });
 
-    manager = new KanbanManager(app, projectConfig);
+    manager = new TaskManager(app, projectConfig);
   });
 
   afterEach(() => {
@@ -57,111 +57,6 @@ describe('KanbanManager', () => {
     } catch {
       // ignore cleanup errors
     }
-  });
-
-  describe('parseCommand', () => {
-    it('should parse "board"', () => {
-      expect(manager.parseCommand('board')).toEqual({ type: 'board' });
-    });
-
-    it('should parse "board" case-insensitive', () => {
-      expect(manager.parseCommand('BOARD')).toEqual({ type: 'board' });
-    });
-
-    it('should parse "add task" with description', () => {
-      expect(manager.parseCommand('add task implement auth')).toEqual({
-        type: 'add',
-        title: 'implement auth',
-      });
-    });
-
-    it('should parse "Add Task" case-insensitive', () => {
-      expect(manager.parseCommand('Add Task fix the login bug')).toEqual({
-        type: 'add',
-        title: 'fix the login bug',
-      });
-    });
-
-    it('should parse "done" with ref', () => {
-      expect(manager.parseCommand('done 1')).toEqual({
-        type: 'done',
-        ref: '1',
-      });
-    });
-
-    it('should parse "done" with #ref', () => {
-      expect(manager.parseCommand('done #3')).toEqual({
-        type: 'done',
-        ref: '#3',
-      });
-    });
-
-    it('should parse "move" with ref and status', () => {
-      expect(manager.parseCommand('move 1 in_progress')).toEqual({
-        type: 'move',
-        ref: '1',
-        status: 'in_progress',
-      });
-    });
-
-    it('should parse "move" with various statuses', () => {
-      expect(manager.parseCommand('move 2 review')).toEqual({
-        type: 'move',
-        ref: '2',
-        status: 'review',
-      });
-      expect(manager.parseCommand('move 3 planning')).toEqual({
-        type: 'move',
-        ref: '3',
-        status: 'planning',
-      });
-      expect(manager.parseCommand('move 4 backlog')).toEqual({
-        type: 'move',
-        ref: '4',
-        status: 'backlog',
-      });
-      expect(manager.parseCommand('move 5 clarification_needed')).toEqual({
-        type: 'move',
-        ref: '5',
-        status: 'clarification_needed',
-      });
-    });
-
-    it('should reject "move" with invalid status', () => {
-      expect(manager.parseCommand('move 1 invalid')).toBeNull();
-      expect(manager.parseCommand('move 1 testing')).toBeNull(); // removed status
-    });
-
-    it('should parse "sync"', () => {
-      expect(manager.parseCommand('sync')).toEqual({ type: 'sync' });
-    });
-
-    it('should parse "sync projects"', () => {
-      expect(manager.parseCommand('sync projects')).toEqual({ type: 'sync' });
-    });
-
-    it('should parse "go" command', () => {
-      expect(manager.parseCommand('go 1')).toEqual({ type: 'go', ref: '1' });
-      expect(manager.parseCommand('go #3')).toEqual({ type: 'go', ref: '#3' });
-    });
-
-    it('should parse "answer" command', () => {
-      expect(manager.parseCommand('answer 1 yes do it')).toEqual({
-        type: 'answer',
-        ref: '1',
-        response: 'yes do it',
-      });
-    });
-
-    it('should parse "approve" command', () => {
-      expect(manager.parseCommand('approve 2')).toEqual({ type: 'approve', ref: '2' });
-    });
-
-    it('should return null for unrecognized text', () => {
-      expect(manager.parseCommand('help me with code')).toBeNull();
-      expect(manager.parseCommand('')).toBeNull();
-      expect(manager.parseCommand('add something')).toBeNull();
-    });
   });
 
   describe('addItem', () => {
@@ -253,67 +148,9 @@ describe('KanbanManager', () => {
     });
   });
 
-  describe('formatBoard', () => {
-    it('should show empty state', () => {
-      const board = manager.formatBoard([]);
-      expect(board).toContain('No tasks yet');
-      expect(board).toContain('add task');
-    });
-
-    it('should group items by status', async () => {
-      await manager.addItem('C123', 'Backlog task');
-      await manager.addItem('C123', 'In progress task', 'in_progress');
-      await manager.addItem('C123', 'Done task', 'done');
-
-      const items = manager.listItems('C123');
-      const board = manager.formatBoard(items);
-
-      expect(board).toContain('Backlog');
-      expect(board).toContain('In Progress');
-      expect(board).toContain('Done');
-      expect(board).toContain('1/3');
-    });
-
-    it('should show source tags for claude items', async () => {
-      await manager.addItem('C123', 'AI generated task', 'backlog', 'claude');
-      const items = manager.listItems('C123');
-      const board = manager.formatBoard(items);
-      expect(board).toContain('`\u{1f916}`');
-    });
-
-    it('should show acceptance criteria count', async () => {
-      const store = manager.getStore('C123');
-      store.addItem({
-        title: 'Task with AC',
-        status: 'planning',
-        source: 'claude',
-        acceptanceCriteria: ['AC 1', 'AC 2'],
-      });
-
-      const items = manager.listItems('C123');
-      const board = manager.formatBoard(items);
-      expect(board).toContain('2 AC');
-    });
-
-    it('should show question count for clarification items', async () => {
-      const store = manager.getStore('C123');
-      store.addItem({
-        title: 'Task with questions',
-        status: 'clarification_needed',
-        source: 'claude',
-        questions: ['What framework?', 'What DB?'],
-      });
-
-      const items = manager.listItems('C123');
-      const board = manager.formatBoard(items);
-      expect(board).toContain('Clarification Needed');
-      expect(board).toContain('\u{2753}2');
-    });
-  });
-
-  describe('syncTodosToKanban', () => {
-    it('should add new todos as kanban items', async () => {
-      await manager.syncTodosToKanban('C123', [
+  describe('syncTodosToTasks', () => {
+    it('should add new todos as task items', async () => {
+      await manager.syncTodosToTasks('C123', [
         { id: '1', content: 'Fix bug', status: 'pending' },
         { id: '2', content: 'Add tests', status: 'in_progress' },
       ]);
@@ -328,7 +165,7 @@ describe('KanbanManager', () => {
     });
 
     it('should map completed todos to review status (two-party validation)', async () => {
-      await manager.syncTodosToKanban('C123', [
+      await manager.syncTodosToTasks('C123', [
         { id: '1', content: 'Fix bug', status: 'completed' },
       ]);
 
@@ -337,11 +174,11 @@ describe('KanbanManager', () => {
     });
 
     it('should update existing items on re-sync', async () => {
-      await manager.syncTodosToKanban('C123', [
+      await manager.syncTodosToTasks('C123', [
         { id: '1', content: 'Fix bug', status: 'pending' },
       ]);
 
-      await manager.syncTodosToKanban('C123', [
+      await manager.syncTodosToTasks('C123', [
         { id: '1', content: 'Fix bug', status: 'in_progress' },
       ]);
 
@@ -351,7 +188,7 @@ describe('KanbanManager', () => {
     });
 
     it('should not override done status on re-sync', async () => {
-      await manager.syncTodosToKanban('C123', [
+      await manager.syncTodosToTasks('C123', [
         { id: '1', content: 'Fix bug', status: 'pending' },
       ]);
 
@@ -359,7 +196,7 @@ describe('KanbanManager', () => {
       await manager.updateItemStatus('C123', '1', 'done');
 
       // Claude re-syncs with completed (normally maps to review)
-      await manager.syncTodosToKanban('C123', [
+      await manager.syncTodosToTasks('C123', [
         { id: '1', content: 'Fix bug', status: 'completed' },
       ]);
 

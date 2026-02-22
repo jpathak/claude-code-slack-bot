@@ -115,6 +115,79 @@ describe('Task Recovery', () => {
         }
       }
     });
+
+    it('should clear executingAgent when recovering in_progress tasks', () => {
+      const item = store.addItem({ title: 'Stuck implementation', status: 'in_progress', source: 'user' });
+      store.updateItem(item.id, { executingAgent: 'slack-bot' });
+      expect(store.findItem(item.id)?.executingAgent).toBe('slack-bot');
+
+      // Simulate startup recovery: move to ready and clear executingAgent
+      const items = store.getItems();
+      for (const i of items) {
+        if (i.status === 'in_progress') {
+          store.moveItem(i.id, 'ready');
+          store.updateItem(i.id, { executingAgent: undefined });
+        }
+      }
+
+      const recovered = store.findItem(item.id);
+      expect(recovered?.status).toBe('ready');
+      expect(recovered?.executingAgent).toBeUndefined();
+    });
+
+    it('should clear executingAgent when recovering planning tasks', () => {
+      const item = store.addItem({ title: 'Stuck planning', status: 'planning', source: 'user' });
+      store.updateItem(item.id, { executingAgent: 'slack-bot' });
+      expect(store.findItem(item.id)?.executingAgent).toBe('slack-bot');
+
+      // Simulate startup recovery: move to backlog and clear executingAgent
+      const items = store.getItems();
+      for (const i of items) {
+        if (i.status === 'planning' && i.executingAgent !== 'claude-code') {
+          store.moveItem(i.id, 'backlog');
+          store.updateItem(i.id, { executingAgent: undefined });
+        }
+      }
+
+      const recovered = store.findItem(item.id);
+      expect(recovered?.status).toBe('backlog');
+      expect(recovered?.executingAgent).toBeUndefined();
+    });
+
+    it('should skip tasks owned by claude-code during recovery', () => {
+      const cliTask = store.addItem({ title: 'CLI-owned task', status: 'in_progress', source: 'user' });
+      store.updateItem(cliTask.id, { executingAgent: 'claude-code' });
+
+      const botTask = store.addItem({ title: 'Bot-owned task', status: 'in_progress', source: 'user' });
+      store.updateItem(botTask.id, { executingAgent: 'slack-bot' });
+
+      const unownedTask = store.addItem({ title: 'Unowned task', status: 'in_progress', source: 'user' });
+
+      // Simulate startup recovery with claude-code skip
+      const items = store.getItems();
+      for (const i of items) {
+        if (i.executingAgent === 'claude-code') continue;
+        if (i.status === 'in_progress') {
+          store.moveItem(i.id, 'ready');
+          store.updateItem(i.id, { executingAgent: undefined });
+        }
+      }
+
+      // CLI-owned task should be untouched
+      const cliRecovered = store.findItem(cliTask.id);
+      expect(cliRecovered?.status).toBe('in_progress');
+      expect(cliRecovered?.executingAgent).toBe('claude-code');
+
+      // Bot-owned task should be recovered
+      const botRecovered = store.findItem(botTask.id);
+      expect(botRecovered?.status).toBe('ready');
+      expect(botRecovered?.executingAgent).toBeUndefined();
+
+      // Unowned task should be recovered
+      const unownedRecovered = store.findItem(unownedTask.id);
+      expect(unownedRecovered?.status).toBe('ready');
+      expect(unownedRecovered?.executingAgent).toBeUndefined();
+    });
   });
 
   describe('config defaults', () => {

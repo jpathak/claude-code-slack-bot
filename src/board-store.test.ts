@@ -23,13 +23,13 @@ describe('BoardStore', () => {
   });
 
   describe('initialization', () => {
-    it('should create .kanban directory and board.json on first load', () => {
+    it('should create .tasks directory and board.json on first load', () => {
       const data = store.load();
       expect(data.version).toBe(1);
       expect(data.items).toEqual([]);
       expect(data.nextId).toBe(1);
       expect(data.columns).toHaveLength(7);
-      expect(fs.existsSync(path.join(tmpDir, '.kanban', 'board.json'))).toBe(true);
+      expect(fs.existsSync(path.join(tmpDir, '.tasks', 'board.json'))).toBe(true);
     });
 
     it('should use the directory basename as project name', () => {
@@ -273,13 +273,50 @@ describe('BoardStore', () => {
     });
   });
 
+  describe('executingAgent', () => {
+    it('should persist executingAgent through save/load cycle', () => {
+      const item = store.addItem({ title: 'Agent task', executingAgent: 'claude-code' });
+      expect(item.executingAgent).toBe('claude-code');
+
+      // Re-read from disk via a fresh store
+      const store2 = new BoardStore(tmpDir);
+      const loaded = store2.findItem(item.id);
+      expect(loaded?.executingAgent).toBe('claude-code');
+      store2.dispose();
+    });
+
+    it('should set executingAgent via updateItem', () => {
+      const item = store.addItem({ title: 'Agent task' });
+      expect(item.executingAgent).toBeUndefined();
+
+      const updated = store.updateItem(item.id, { executingAgent: 'slack-bot' });
+      expect(updated?.executingAgent).toBe('slack-bot');
+    });
+
+    it('should clear executingAgent when set to empty string', () => {
+      const item = store.addItem({ title: 'Agent task', executingAgent: 'slack-bot' });
+      expect(item.executingAgent).toBe('slack-bot');
+
+      const updated = store.updateItem(item.id, { executingAgent: '' });
+      expect(updated?.executingAgent).toBeUndefined();
+    });
+
+    it('should clear executingAgent when set to undefined', () => {
+      const item = store.addItem({ title: 'Agent task', executingAgent: 'claude-code' });
+      expect(item.executingAgent).toBe('claude-code');
+
+      const updated = store.updateItem(item.id, { executingAgent: undefined });
+      expect(updated?.executingAgent).toBeUndefined();
+    });
+  });
+
   describe('atomic writes', () => {
     it('should use temp file + rename pattern', () => {
       // Add an item and verify no temp files remain
       store.addItem({ title: 'Atomic test' });
 
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      const files = fs.readdirSync(kanbanDir);
+      const tasksDir = path.join(tmpDir, '.tasks');
+      const files = fs.readdirSync(tasksDir);
       const tmpFiles = files.filter(f => f.startsWith('.board.json.tmp'));
       expect(tmpFiles).toHaveLength(0);
     });
@@ -317,16 +354,16 @@ describe('BoardStore', () => {
     });
 
     it('should return the board file path', () => {
-      expect(store.getBoardFilePath()).toBe(path.join(tmpDir, '.kanban', 'board.json'));
+      expect(store.getBoardFilePath()).toBe(path.join(tmpDir, '.tasks', 'board.json'));
     });
   });
 
   describe('load with corrupted file', () => {
     it('should create fresh board if file is corrupted JSON', () => {
-      // Create the .kanban dir and write garbage
-      const kanbanDir = path.join(tmpDir, '.kanban');
-      fs.mkdirSync(kanbanDir, { recursive: true });
-      fs.writeFileSync(path.join(kanbanDir, 'board.json'), '{invalid json!!!', 'utf-8');
+      // Create the .tasks dir and write garbage
+      const tasksDir = path.join(tmpDir, '.tasks');
+      fs.mkdirSync(tasksDir, { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, 'board.json'), '{invalid json!!!', 'utf-8');
 
       const data = store.load();
       expect(data.version).toBe(1);
@@ -336,7 +373,7 @@ describe('BoardStore', () => {
 
   describe('file watcher (directory-based)', () => {
     it('should detect external writes via atomic rename', async () => {
-      // Initialize the board so the .kanban dir exists
+      // Initialize the board so the .tasks dir exists
       store.load();
 
       let changeDetected = false;
@@ -409,6 +446,31 @@ describe('BoardStore', () => {
       // Should not throw
       store.dispose();
       store.dispose(); // Double dispose should be safe
+    });
+
+    it('should clear pending debounce timer on dispose', () => {
+      store.addItem({ title: 'Setup' });
+      let callbackFired = false;
+      store.onChanged(() => { callbackFired = true; });
+
+      // Trigger a file change that would start a debounce timer
+      // by writing directly to the board file (simulating external change)
+      const boardFile = store.getBoardFilePath();
+      const data = JSON.parse(fs.readFileSync(boardFile, 'utf-8'));
+      data.items[0].title = 'Modified externally';
+      fs.writeFileSync(boardFile, JSON.stringify(data, null, 2));
+
+      // Immediately dispose before debounce fires
+      store.dispose();
+
+      // Wait longer than debounce period (100ms) to verify timer was cleared
+      return new Promise<void>((resolve) => {
+        setTimeout(() => {
+          // Callback should NOT have fired since we disposed before debounce completed
+          expect(callbackFired).toBe(false);
+          resolve();
+        }, 300);
+      });
     });
   });
 });

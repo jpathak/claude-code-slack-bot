@@ -7,9 +7,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc && npm run web:build",
-    "web:dev": "cd web && npx vite",
-    "web:build": "cd web && npx vite build",
+    "build": "tsc",
     "prod": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -18,7 +16,6 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "@types/express": "^5.0.6",
     "@types/node": "^24.0.4",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
@@ -30,8 +27,8 @@
     "@slack/bolt": "^4.4.0",
     "@types/node-fetch": "^2.6.12",
     "dotenv": "^16.6.0",
-    "express": "^5.2.1",
     "node-fetch": "^3.3.2",
+    "sharp": "^0.33.5",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0"
   }

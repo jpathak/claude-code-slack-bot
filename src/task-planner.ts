@@ -2,9 +2,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from './logger.js';
 import { BoardStore } from './board-store.js';
-import { KanbanItem, BoardData, KanbanStatus, KANBAN_STATUSES } from './types.js';
+import { TaskItem, BoardData, TaskStatus, TASK_STATUSES } from './types.js';
 
-const STATUS_LABELS: Record<KanbanStatus, string> = {
+const STATUS_LABELS: Record<TaskStatus, string> = {
   backlog: 'Backlog',
   clarification_needed: 'Clarification Needed',
   planning: 'Planning',
@@ -59,7 +59,7 @@ export class TaskPlanner {
   /**
    * Save the planning output as a spec document for the task.
    */
-  savePlanSpec(projectPath: string, item: KanbanItem, planningOutput: string): string {
+  savePlanSpec(projectPath: string, item: TaskItem, planningOutput: string): string {
     const content = [
       `# Task #${item.id}: ${item.title}`,
       '',
@@ -77,7 +77,7 @@ export class TaskPlanner {
   /**
    * Save implementation notes as a spec document.
    */
-  saveImplementationSpec(projectPath: string, item: KanbanItem, output: string): string {
+  saveImplementationSpec(projectPath: string, item: TaskItem, output: string): string {
     const content = [
       `# Implementation: Task #${item.id} - ${item.title}`,
       '',
@@ -94,7 +94,7 @@ export class TaskPlanner {
    * Generate a planning prompt that instructs Claude to analyze a task
    * and produce acceptance criteria, questions, and subtasks.
    */
-  generatePlanningPrompt(item: KanbanItem, projectPath?: string): string {
+  generatePlanningPrompt(item: TaskItem, projectPath?: string): string {
     const descriptionBlock = item.description
       ? `\nDescription: ${item.description}`
       : '';
@@ -137,7 +137,7 @@ export class TaskPlanner {
   /**
    * Generate an implementation prompt for a task that includes its spec context.
    */
-  generateImplementationPrompt(item: KanbanItem, projectPath: string): string {
+  generateImplementationPrompt(item: TaskItem, projectPath: string): string {
     const acSection = item.acceptanceCriteria?.length
       ? '\n\nAcceptance Criteria:\n' + item.acceptanceCriteria.map(ac => `- [ ] ${ac}`).join('\n')
       : '';
@@ -166,7 +166,7 @@ export class TaskPlanner {
    * Generate a retry implementation prompt when a task is moved back from review to in_progress.
    * Includes the previous implementation notes so Claude knows what was already tried.
    */
-  generateRetryImplementationPrompt(item: KanbanItem, projectPath: string): string {
+  generateRetryImplementationPrompt(item: TaskItem, projectPath: string): string {
     const acSection = item.acceptanceCriteria?.length
       ? '\n\nAcceptance Criteria:\n' + item.acceptanceCriteria.map(ac => `- [ ] ${ac}`).join('\n')
       : '';
@@ -249,7 +249,7 @@ export class TaskPlanner {
       '',
     ];
 
-    for (const status of KANBAN_STATUSES) {
+    for (const status of TASK_STATUSES) {
       const items = boardData.items.filter(i => i.status === status);
       lines.push(`${STATUS_LABELS[status]} (${items.length}):`);
 
@@ -281,7 +281,7 @@ export class TaskPlanner {
   async processNewTask(
     store: BoardStore,
     itemId: string,
-  ): Promise<{ planningPrompt: string; item: KanbanItem } | null> {
+  ): Promise<{ planningPrompt: string; item: TaskItem } | null> {
     const item = store.findItem(itemId);
     if (!item) {
       this.logger.warn('processNewTask: item not found', { itemId });
@@ -313,7 +313,7 @@ export class TaskPlanner {
     store: BoardStore,
     itemId: string,
     output: string,
-  ): Promise<KanbanItem | null> {
+  ): Promise<TaskItem | null> {
     const item = store.findItem(itemId);
     if (!item) {
       this.logger.warn('applyPlanningResult: item not found', { itemId });
@@ -325,7 +325,7 @@ export class TaskPlanner {
     // Save the plan spec to disk
     this.savePlanSpec(store.getProjectPath(), item, output);
 
-    const updates: Partial<KanbanItem> = {};
+    const updates: Partial<TaskItem> = {};
 
     if (parsed.acceptanceCriteria.length > 0) {
       updates.acceptanceCriteria = parsed.acceptanceCriteria;

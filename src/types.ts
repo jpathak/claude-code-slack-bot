@@ -41,38 +41,30 @@ export interface ProjectMapping {
   lastSyncedAt: string;
 }
 
-// Kanban board types
-export const KANBAN_STATUSES = ['backlog', 'clarification_needed', 'planning', 'ready', 'in_progress', 'review', 'done'] as const;
-export type KanbanStatus = typeof KANBAN_STATUSES[number];
+// Task board types
+export const TASK_STATUSES = ['backlog', 'clarification_needed', 'planning', 'ready', 'in_progress', 'review', 'done'] as const;
+export type TaskStatus = typeof TASK_STATUSES[number];
 
-export interface KanbanItem {
+export interface TaskItem {
   id: string;
   title: string;
   description?: string;
   acceptanceCriteria?: string[];
-  status: KanbanStatus;
+  status: TaskStatus;
   assignee?: string;
   source: 'claude' | 'user';
   questions?: string[];
   /** Slack thread timestamp where clarification is being requested */
   clarificationThreadTs?: string;
+  /** Which agent is currently executing this task (e.g., 'slack-bot', 'claude-code') */
+  executingAgent?: string;
   createdAt: string;
   updatedAt: string;
 }
 
-export type KanbanCommand =
-  | { type: 'board' }
-  | { type: 'add'; title: string }
-  | { type: 'done'; ref: string }
-  | { type: 'move'; ref: string; status: KanbanStatus }
-  | { type: 'sync' }
-  | { type: 'go'; ref: string }
-  | { type: 'answer'; ref: string; response: string }
-  | { type: 'approve'; ref: string };
-
 // Board store types (file-backed persistent storage)
 export interface BoardColumn {
-  id: KanbanStatus;
+  id: TaskStatus;
   label: string;
   color: string;
 }
@@ -91,7 +83,7 @@ export interface BoardData {
   version: 1;
   projectName: string;
   columns: BoardColumn[];
-  items: KanbanItem[];
+  items: TaskItem[];
   nextId: number;
   updatedAt: string;
 }
