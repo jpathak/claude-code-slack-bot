@@ -175,7 +175,19 @@ export class TrelloSync {
       // Find or create a Trello board
       const board = await this.findOrCreateBoard(projectName);
       if (!board) {
-        this.logger.error('Failed to create or find Trello board', { projectName });
+        // API failure - fall back to existing mapping if available.
+        // This prevents the bot from losing sync on transient network issues.
+        const existingMapping = this.loadMapping(projectPath);
+        if (existingMapping) {
+          this.logger.warn('Using cached Trello mapping after API failure', {
+            projectName,
+            boardId: existingMapping.boardId,
+          });
+          // Still wire up watchers using the cached mapping
+          this.wireOutboundWatcher(channelId, projectPath);
+          return;
+        }
+        this.logger.error('Failed to find Trello board and no cached mapping exists', { projectName });
         return;
       }
 
@@ -420,15 +432,21 @@ export class TrelloSync {
   private async findOrCreateBoard(boardName: string): Promise<TrelloBoard | null> {
     // Search existing boards for a match
     const boards = await this.trelloFetch<TrelloBoard[]>('GET', '/members/me/boards?filter=open');
-    if (boards) {
-      const existing = boards.find(b => b.name === boardName);
-      if (existing) {
-        this.logger.info('Found existing Trello board', { name: boardName, id: existing.id });
-        return existing;
-      }
+    if (!boards) {
+      // API call failed - do NOT create a new board, as the existing one
+      // may exist but we just couldn't fetch the list. Creating a new board
+      // here would produce duplicates.
+      this.logger.warn('Failed to fetch Trello boards list, skipping board creation to avoid duplicates', { boardName });
+      return null;
     }
 
-    // Create new board
+    const existing = boards.find(b => b.name === boardName);
+    if (existing) {
+      this.logger.info('Found existing Trello board', { name: boardName, id: existing.id });
+      return existing;
+    }
+
+    // Board list fetched successfully but no match found - safe to create
     const newBoard = await this.trelloFetch<TrelloBoard>('POST', '/boards', {
       name: boardName,
       defaultLists: false,
