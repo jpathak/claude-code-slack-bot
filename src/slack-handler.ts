@@ -1197,6 +1197,23 @@ export class SlackHandler {
       channelId, itemId, newStatus, oldStatus, projectPath,
     });
 
+    // CRITICAL: Always sync local status to match the Trello-initiated change.
+    // The inbound sync may skip local status updates when executingAgent is set
+    // (to prevent reverting agent-driven changes). But when we reach THIS handler,
+    // we know the transition was initiated externally (via Trello board), so we
+    // must ensure the local status matches. Otherwise, the outbound sync will
+    // push the stale local status back to Trello, reverting the user's card move.
+    if (this.taskManager) {
+      const syncStore = this.taskManager.getStore(channelId);
+      const syncItem = syncStore.findItem(itemId);
+      if (syncItem && syncItem.status !== newStatus) {
+        this.logger.info('Syncing local status to match Trello-initiated transition', {
+          itemId, localStatus: syncItem.status, trelloStatus: newStatus,
+        });
+        syncStore.moveItem(itemId, newStatus as any);
+      }
+    }
+
     if (newStatus === 'planning') {
       const result = await this.app.client.chat.postMessage({
         channel: channelId,
@@ -1449,13 +1466,30 @@ export class SlackHandler {
     }
 
     if (!planningOutput.trim()) {
-      this.logger.warn('Planning returned empty output', { itemId });
+      this.logger.warn('Planning returned empty output, moving task to backlog', { itemId });
+      // Move task back to backlog so it can be re-planned
+      store.moveItem(itemId, 'backlog');
+      store.updateItem(itemId, { executingAgent: undefined });
+      await say({
+        text: `⚠️ Planning for task *#${itemId}* returned no output. Task moved back to *Backlog*.`,
+        thread_ts: threadTs,
+      });
       return;
     }
 
     // Apply planning result (this also saves the spec to .specs/<id>/plan.md)
     const updated = await this.taskPlanner.applyPlanningResult(store, itemId, planningOutput);
-    if (!updated) return;
+    if (!updated) {
+      this.logger.error('applyPlanningResult returned null, moving task to backlog', { itemId });
+      // Move task back to backlog so it can be re-planned
+      store.moveItem(itemId, 'backlog');
+      store.updateItem(itemId, { executingAgent: undefined });
+      await say({
+        text: `⚠️ Failed to apply planning result for task *#${itemId}*. Task moved back to *Backlog*.`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
 
     // Release agent claim after planning completes
     store.updateItem(itemId, { executingAgent: undefined });
@@ -1970,13 +2004,28 @@ export class SlackHandler {
     }
 
     if (!planningOutput.trim()) {
-      this.logger.warn('Re-planning returned empty output', { itemId });
+      this.logger.warn('Re-planning returned empty output, moving task to backlog', { itemId });
+      store.moveItem(itemId, 'backlog');
+      store.updateItem(itemId, { executingAgent: undefined });
+      await say({
+        text: `⚠️ Re-planning for task *#${itemId}* returned no output. Task moved back to *Backlog*.`,
+        thread_ts: threadTs,
+      });
       return;
     }
 
     // Apply planning result (this also saves the spec to .specs/<id>/plan.md)
     const updated = await this.taskPlanner.applyPlanningResult(store, itemId, planningOutput);
-    if (!updated) return;
+    if (!updated) {
+      this.logger.error('applyPlanningResult returned null during re-planning, moving task to backlog', { itemId });
+      store.moveItem(itemId, 'backlog');
+      store.updateItem(itemId, { executingAgent: undefined });
+      await say({
+        text: `⚠️ Failed to apply re-planning result for task *#${itemId}*. Task moved back to *Backlog*.`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
 
     // Release agent claim after re-planning completes
     store.updateItem(itemId, { executingAgent: undefined });

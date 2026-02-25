@@ -115,7 +115,9 @@ export class TaskPlanner {
     return [
       `You are planning task #${item.id}: "${item.title}"${descriptionBlock}${specContext}`,
       '',
-      'Analyze this task and produce a structured plan. Your output MUST use the exact section headers below.',
+      'IMPORTANT: Produce a structured plan with the EXACT section headers shown below.',
+      'Output the plan as plain text - do NOT use the Write tool to save it (the system will save your output automatically).',
+      'You may explore the codebase first, but your FINAL output MUST be the structured plan in this format:',
       '',
       '## Acceptance Criteria',
       'List 3-7 testable, specific acceptance criteria. Each must be a concrete, verifiable condition.',
@@ -130,6 +132,8 @@ export class TaskPlanner {
       'If the task is large, break it into smaller implementation subtasks.',
       'If the task is small enough to implement in one step, write: - None',
       'Use the format: - <subtask>',
+      '',
+      'CRITICAL: Your final response MUST contain all three sections with the exact "## Acceptance Criteria", "## Questions", and "## Subtasks" headers.',
       specsNote,
     ].join('\n');
   }
@@ -227,12 +231,34 @@ export class TaskPlanner {
       const heading = section.heading.toLowerCase();
       const items = this.parseListItems(section.body);
 
-      if (heading.includes('acceptance criteria')) {
+      if (heading.includes('acceptance criteria') || heading.includes('acceptance_criteria')) {
         result.acceptanceCriteria = items;
-      } else if (heading.includes('question')) {
+      } else if (heading.includes('question') || heading.includes('clarification')) {
         result.questions = items;
-      } else if (heading.includes('subtask')) {
+      } else if (heading.includes('subtask') || heading.includes('sub-task') || heading.includes('implementation step')) {
         result.subtasks = items;
+      }
+    }
+
+    // If no sections were found with the expected headers, log a warning
+    // and attempt to extract list items from the entire output as a fallback
+    if (sections.length === 0 || (result.acceptanceCriteria.length === 0 && result.questions.length === 0)) {
+      this.logger.warn('parsePlanningOutput: no recognized sections found, attempting fallback extraction', {
+        sectionCount: sections.length,
+        sectionHeadings: sections.map(s => s.heading),
+        outputLength: output.length,
+        outputPreview: output.substring(0, 200),
+      });
+
+      // Fallback: try to find any checkbox items in the raw output as acceptance criteria
+      if (result.acceptanceCriteria.length === 0) {
+        const fallbackItems = this.parseListItems(output);
+        if (fallbackItems.length > 0) {
+          result.acceptanceCriteria = fallbackItems;
+          this.logger.info('parsePlanningOutput: extracted fallback acceptance criteria from raw output', {
+            count: fallbackItems.length,
+          });
+        }
       }
     }
 
@@ -329,6 +355,12 @@ export class TaskPlanner {
 
     if (parsed.acceptanceCriteria.length > 0) {
       updates.acceptanceCriteria = parsed.acceptanceCriteria;
+    } else {
+      this.logger.warn('applyPlanningResult: no acceptance criteria parsed from planning output', {
+        itemId: item.id,
+        outputLength: output.length,
+        outputPreview: output.substring(0, 300),
+      });
     }
 
     const hasQuestions = parsed.questions.length > 0;

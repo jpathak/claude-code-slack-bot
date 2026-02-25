@@ -185,7 +185,7 @@ export class ChannelProvisioner {
   }
 
   /**
-   * Adopt an existing channel: set working directory and save mapping.
+   * Adopt an existing channel: join the channel, set working directory and save mapping.
    */
   private async adoptChannel(
     channelId: string,
@@ -193,6 +193,17 @@ export class ChannelProvisioner {
     project: ProjectInfo,
   ): Promise<'adopted'> {
     this.logger.info('Adopting existing channel', { channelName, channelId, project: project.name });
+
+    // Join the channel so the bot can post messages
+    try {
+      await this.app.client.conversations.join({ channel: channelId });
+      this.logger.info('Joined channel', { channelName, channelId });
+    } catch (error: any) {
+      // already_in_channel is fine, other errors should be logged
+      if (error?.data?.error !== 'already_in_channel') {
+        this.logger.warn('Failed to join channel', { channelName, channelId, error: error?.data?.error || error });
+      }
+    }
 
     // Set the working directory for this channel
     this.workingDirManager.setWorkingDirectory(channelId, project.path);

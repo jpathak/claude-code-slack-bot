@@ -275,6 +275,53 @@ describe('TaskPlanner', () => {
         'Users receive confirmation email',
       ]);
     });
+
+    it('should match alternate heading names like "Clarification" for questions', () => {
+      const output = [
+        '## Acceptance Criteria',
+        '- [ ] Task completes successfully',
+        '',
+        '## Clarification',
+        '- What environment should this target?',
+        '',
+        '## Implementation Steps',
+        '- Step 1: Setup environment',
+      ].join('\n');
+
+      const result = planner.parsePlanningOutput(output);
+
+      expect(result.acceptanceCriteria).toEqual(['Task completes successfully']);
+      expect(result.questions).toEqual(['What environment should this target?']);
+      expect(result.subtasks).toEqual(['Step 1: Setup environment']);
+    });
+
+    it('should fallback to extracting list items from raw output when no sections found', () => {
+      const output = [
+        'Here is my analysis of the task:',
+        '',
+        '- [ ] The API should return 200 for valid requests',
+        '- [ ] Error responses should include descriptive messages',
+        '- [ ] Rate limiting should be enforced',
+        '',
+        'This task seems straightforward.',
+      ].join('\n');
+
+      const result = planner.parsePlanningOutput(output);
+
+      // Fallback extraction should find the checkbox items
+      expect(result.acceptanceCriteria.length).toBeGreaterThanOrEqual(3);
+      expect(result.acceptanceCriteria).toContain('The API should return 200 for valid requests');
+    });
+
+    it('should handle output with no list items at all gracefully', () => {
+      const output = 'This task looks good. I think we can proceed with implementation.';
+
+      const result = planner.parsePlanningOutput(output);
+
+      expect(result.acceptanceCriteria).toEqual([]);
+      expect(result.questions).toEqual([]);
+      expect(result.subtasks).toEqual([]);
+    });
   });
 
   // --- generateBoardContext ---
@@ -562,6 +609,38 @@ describe('TaskPlanner', () => {
       expect(updated!.status).toBe('clarification_needed');
       expect(updated!.acceptanceCriteria).toBeUndefined();
       expect(updated!.questions).toEqual(['Need more info']);
+    });
+
+    it('should move to ready even when output has no recognized sections', async () => {
+      const item = store.addItem({ title: 'Malformed output task', status: 'planning', source: 'user' });
+
+      // Output without any ## headers - completely unstructured
+      const output = 'This task looks straightforward. We should implement it directly.';
+
+      const updated = await planner.applyPlanningResult(store, item.id, output);
+
+      expect(updated).not.toBeNull();
+      // Even with unstructured output, should still move to ready (no questions = ready)
+      expect(updated!.status).toBe('ready');
+    });
+
+    it('should use fallback-extracted AC when output has list items but no section headers', async () => {
+      const item = store.addItem({ title: 'Fallback AC task', status: 'planning', source: 'user' });
+
+      const output = [
+        'Here is my plan:',
+        '- [ ] API endpoint handles pagination correctly',
+        '- [ ] Default page size is 20',
+        '- [ ] Rate limiting is enforced',
+      ].join('\n');
+
+      const updated = await planner.applyPlanningResult(store, item.id, output);
+
+      expect(updated).not.toBeNull();
+      expect(updated!.status).toBe('ready');
+      // Fallback extraction should pick up the checkbox items
+      expect(updated!.acceptanceCriteria).toBeDefined();
+      expect(updated!.acceptanceCriteria!.length).toBeGreaterThanOrEqual(3);
     });
 
     it('should persist changes to the store', async () => {

@@ -887,7 +887,25 @@ export class TrelloSync {
         // which includes AC, questions, etc. We must NOT write that back into item.description
         // (which is the raw description field), or it will cause description corruption and
         // an infinite sync loop.
-        const updates: Partial<typeof localItem> = { status: newStatus };
+        const updates: Partial<typeof localItem> = {};
+
+        // CRITICAL: Do NOT update status if an agent is currently executing this task.
+        // The executing agent (slack-bot or claude-code) is responsible for status transitions.
+        // If we overwrite the status here, we could revert agent-made changes before they
+        // sync to Trello, causing tasks to get "stuck" in planning when they should be
+        // in ready/clarification_needed.
+        if (!localItem.executingAgent) {
+          if (oldStatus !== newStatus) {
+            updates.status = newStatus;
+          }
+        } else {
+          this.logger.debug('Skipping status update for agent-claimed item', {
+            itemId: localItem.id,
+            executingAgent: localItem.executingAgent,
+            localStatus: oldStatus,
+            trelloStatus: newStatus,
+          });
+        }
 
         if (card.name !== localItem.title) {
           updates.title = card.name;
@@ -900,10 +918,27 @@ export class TrelloSync {
           updates.description = strippedDesc || undefined;
         }
 
-        store.updateItem(localItem.id, updates);
+        // Only update if there are changes to apply
+        if (Object.keys(updates).length > 0) {
+          store.updateItem(localItem.id, updates);
+        }
 
         existingMapping.lastTrelloHash = trelloHash;
-        existingMapping.lastLocalHash = trelloHash;
+        // Only update lastLocalHash to match Trello if we actually applied
+        // the status change locally. If we skipped the status update (because
+        // executingAgent was set), keep lastLocalHash at the current local value
+        // so the outbound sync doesn't push stale local status back to Trello.
+        if (!localItem.executingAgent || oldStatus === newStatus) {
+          existingMapping.lastLocalHash = trelloHash;
+        } else {
+          // Recompute local hash from current local state to prevent outbound
+          // sync from reverting the Trello status
+          existingMapping.lastLocalHash = this.hashItem(
+            localItem.title,
+            this.formatCardDescription(localItem),
+            localItem.status,
+          );
+        }
         existingMapping.lastSyncedAt = new Date().toISOString();
         mappingChanged = true;
 
