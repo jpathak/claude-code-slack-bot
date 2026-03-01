@@ -89,6 +89,13 @@ export class SlackHandler {
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botUserId: string | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
+  /**
+   * Tracks threads where the bot has been active from user-initiated queries.
+   * Key: "channelId:threadTs", Value: timestamp when last active.
+   * Thread replies in project channels are only processed if the thread is tracked here,
+   * the user @mentions the bot, or it's a clarification thread.
+   */
+  private botActiveThreads: Map<string, number> = new Map();
 
   constructor(app: AppType, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -906,6 +913,41 @@ export class SlackHandler {
   private isProjectChannel(channelId: string): boolean {
     if (!this.projectConfig) return false;
     return !!this.projectConfig.getByChannelId(channelId);
+  }
+
+  /**
+   * Mark a thread as having active bot conversation from a user-initiated query.
+   * This prevents the bot from ignoring follow-up thread replies.
+   */
+  private markBotActiveThread(channelId: string, threadTs: string): void {
+    const key = `${channelId}:${threadTs}`;
+    this.botActiveThreads.set(key, Date.now());
+
+    // Cap size: remove oldest entries when map exceeds 500 threads
+    if (this.botActiveThreads.size > 500) {
+      const entries = [...this.botActiveThreads.entries()]
+        .sort((a, b) => a[1] - b[1]);
+      // Remove oldest 100
+      for (let i = 0; i < 100 && i < entries.length; i++) {
+        this.botActiveThreads.delete(entries[i][0]);
+      }
+    }
+  }
+
+  /**
+   * Check if the bot has been active in a thread from a user-initiated query.
+   */
+  private isBotActiveThread(channelId: string, threadTs: string): boolean {
+    const key = `${channelId}:${threadTs}`;
+    const lastActive = this.botActiveThreads.get(key);
+    if (!lastActive) return false;
+    // Expire after 24 hours
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+    if (Date.now() - lastActive > TWENTY_FOUR_HOURS) {
+      this.botActiveThreads.delete(key);
+      return false;
+    }
+    return true;
   }
 
   private isMcpInfoCommand(text: string): boolean {
@@ -2270,9 +2312,26 @@ export class SlackHandler {
         this.logger.info('Handling direct message event');
         await this.handleMessage(message as MessageEvent, say);
       } else if (this.isProjectChannel(channelId)) {
-        // Project channels: respond without @mention
+        // Project channels: respond to top-level messages without @mention,
+        // but thread replies require @mention, an active bot conversation, or a clarification thread
         const botUserId = await this.getBotUserId();
         if (message.user === botUserId) return; // Ignore own messages
+
+        // For thread replies: only process if directed at the bot
+        if (message.thread_ts) {
+          const hasBotMention = message.text?.includes(`<@${botUserId}>`);
+          const hasClarificationTask = !!(this.taskManager &&
+            this.findTaskWaitingForClarificationInThread(channelId, message.thread_ts));
+          const isBotThread = this.isBotActiveThread(channelId, message.thread_ts);
+
+          if (!hasBotMention && !hasClarificationTask && !isBotThread) {
+            this.logger.debug('Ignoring thread reply in project channel - not directed at bot', {
+              channel: channelId,
+              thread_ts: message.thread_ts,
+            });
+            return;
+          }
+        }
 
         this.logger.info('Handling project channel message', { channel: channelId });
         // Strip any @mention if present
@@ -2281,6 +2340,12 @@ export class SlackHandler {
           ...message,
           text,
         } as MessageEvent, say);
+
+        // Track this thread as bot-active so follow-up replies are also processed
+        const effectiveThreadTs = message.thread_ts || message.ts;
+        if (effectiveThreadTs) {
+          this.markBotActiveThread(channelId, effectiveThreadTs);
+        }
       }
       // Non-project channels: ignore (handled by app_mention below)
     });
@@ -2428,10 +2493,19 @@ export class SlackHandler {
       });
     }
 
-    // Cleanup inactive sessions periodically
+    // Cleanup inactive sessions and stale thread tracking periodically
     this.cleanupInterval = setInterval(() => {
       this.logger.debug('Running session cleanup');
       this.claudeHandler.cleanupInactiveSessions();
+
+      // Purge bot-active threads older than 24 hours
+      const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      for (const [key, timestamp] of this.botActiveThreads) {
+        if (now - timestamp > TWENTY_FOUR_HOURS) {
+          this.botActiveThreads.delete(key);
+        }
+      }
     }, CLEANUP_INTERVAL_MS);
   }
 

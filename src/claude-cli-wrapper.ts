@@ -95,8 +95,10 @@ export class ClaudeCLIWrapper {
       cwd: options.cwd || process.cwd()
     });
 
-    // Use current Node (should be Node 22 from PATH set in LaunchAgent)
-    const nodePath = process.env.CLAUDE_NODE_PATH || process.execPath;
+    // Resolve Node executable: prefer env override, then stable Homebrew symlink,
+    // then PATH lookup. Avoid process.execPath — it resolves to a Cellar version
+    // path that breaks after brew upgrades.
+    const nodePath = process.env.CLAUDE_NODE_PATH || '/opt/homebrew/bin/node';
 
     this.logger.info('Using Node executable', { nodePath, claudePath: this.claudePath });
 
